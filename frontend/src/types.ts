@@ -22,9 +22,13 @@ export type Suggestion = {
   sections: Section[] | null;
 };
 export type Violation = { id: string; term: number; missing: string[] };
+export type AuditRequirement = { title: string; parent: string | null; courses: string[]; page: number | null };
 export type Progress = {
   credits: number;
-  major: { name: string; have: number; need: number; unit: string; set: string | null; completed?: string[][]; missing: string[][] }[];
+  major: {
+    name: string; have: number; need: number; unit: string; set: string | null;
+    completed?: string[][]; missing: string[][]; auditCompleted?: AuditRequirement[];
+  }[];
   pathways: { slot: string; label: string; course: string | null }[];
 };
 export type SuggestResponse = {
@@ -39,5 +43,6 @@ export type AuditImport = {
   degree: string | null;
   terms: Term[];
   courses: { id: string; code: string; grade: string; credits: number; term: Term['kind']; year: number }[];
+  completedRequirements: AuditRequirement[];
   error?: string;
 };

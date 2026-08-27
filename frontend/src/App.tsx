@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, MotionConfig, motion } from 'motion/react';
-import type { Course, Prereqs, Program, SuggestResponse, Suggestion, Term } from './types';
+import type { Availability, Course, Prereqs, Program, Section, SuggestResponse, Suggestion, Term } from './types';
 import { DEGREE_CREDITS, GEOM, bandH, nextTerm, pos } from './plan';
 import './App.css';
 
@@ -20,6 +20,16 @@ const primary = `inline-flex h-7 items-center rounded-md bg-accent px-2.5 text-[
 const icon = `grid h-7 w-7 shrink-0 place-items-center rounded-md text-ink-2 transition hover:bg-surface-hover hover:text-ink active:bg-line disabled:opacity-40 disabled:hover:bg-transparent ${ring}`;
 const field = `h-7 rounded-md border border-line bg-canvas px-2 text-[13px] text-ink transition placeholder:text-ink-3 hover:border-line-strong focus:border-accent ${ring} focus-visible:ring-accent/25`;
 const tag = 'rounded-sm bg-accent-soft px-1 text-[11px] font-medium text-accent';
+
+// --- schedules: times are minutes past midnight, so overlap is one comparison ---
+const DAYS = [['Mo', 'M'], ['Tu', 'T'], ['We', 'W'], ['Th', 'Th'], ['Fr', 'F']] as const;
+const NO_AVAIL: Availability = { busy: [], earliest: 0, latest: 24 * 60 };
+/** 820 -> "1:40PM" */
+const clock = (m: number) => `${((m / 60 | 0) - 1) % 12 + 1}:${`${m % 60}`.padStart(2, '0')}${m < 720 ? 'AM' : 'PM'}`;
+const hhmm = (m: number) => `${`${m / 60 | 0}`.padStart(2, '0')}:${`${m % 60}`.padStart(2, '0')}`;   // for <input type="time">
+const mins = (v: string) => { const [h, m] = v.split(':').map(Number); return h * 60 + m; };
+/** "TuTh 1:40PM–2:30PM" — what the student actually needs to read off a card. */
+const meets = (s: Section) => (s.start === null ? (s.raw || 'time TBA') : `${s.days} ${clock(s.start)}–${clock(s.end!)}`);
 
 type CourseLocation =
   | { kind: 'term'; index: number }
@@ -49,6 +59,7 @@ export default function App() {
   const [filter, setFilter] = useState({ subject: '', pathway: '', eligible: false });   // add-course box
   const [pid, setPid] = useState<string>(() => store('program') ?? 'CSCI-BS');
   const [breaks, setBreaks] = useState(false);
+  const [avail, setAvail] = useState<Availability>(() => store<Availability>('avail') ?? NO_AVAIL);
   const [terms, setTerms] = useState<Term[]>(() => store<Term[]>(`terms:${store('program') ?? 'CSCI-BS'}`) ?? []);
   const [proposal, setProposal] = useState<Suggestion[]>([]);
   // pins: courses locked into the current proposal (survive Regenerate). queue: wanted later — promoted to a pin the first term they're eligible.
@@ -129,6 +140,10 @@ export default function App() {
   const current = useMemo(() => nextTerm(terms, breaks), [terms, breaks]);
   const done = resp ? resp.progress.credits >= DEGREE_CREDITS : false;
   const credits = (ids: string[]) => ids.reduce((s, id) => s + (courses.get(id)?.credits ?? 0), 0);
+  /** Has the student actually narrowed anything? If not we send no `avail` at all, so the filter is inert. */
+  const availNarrowed = avail.busy.length > 0 || avail.earliest > 0 || avail.latest < 24 * 60;
+  /** True once we are past the term the registrar has published: times are then a season pattern, not a booking. */
+  const pattern = resp?.schedule?.basis === 'pattern';
 
   // --- prerequisite status of a proposed course, mirroring server.py (placement, coreq, verified) ---
   const num = (id: string) => Number((courses.get(id)?.code.split(' ')[1] ?? '').match(/\d+/)?.[0] ?? 0);
@@ -159,7 +174,8 @@ export default function App() {
     if (!program || done) return;
     const ctl = new AbortController();
     const { pins, queue } = latest.current;
-    const body = { program: pid, terms: terms.map(t => t.courses), term: current.kind, pins, queue, fresh: fresh.current };
+    const body = { program: pid, terms: terms.map(t => t.courses), term: current.kind, pins, queue,
+                   fresh: fresh.current, avail: availNarrowed ? avail : null };
     fresh.current = false;
     setLoading(true); setError('');
     fetch('/api/suggest', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: ctl.signal })
@@ -167,7 +183,8 @@ export default function App() {
       .then(r => { setResp(r); setProposal(merge(r)); setLoading(false); })
       .catch(e => { if (e.name !== 'AbortError') { setError(`Backend not reachable (${e.message}). Run: python backend/server.py`); setLoading(false); } });
     return () => ctl.abort();
-  }, [pid, taken, current.kind, !!program]);   // eslint-disable-line react-hooks/exhaustive-deps
+  }, [pid, taken, current.kind, !!program, avail]);   // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { store('avail', avail); }, [avail]);
 
   const approve = () => { if (blocked.length) return; const t = [...terms, { ...current, courses: proposal.map(p => p.id) }]; setTerms(t); store(`terms:${pid}`, t); setPins([]); };
   const reset = () => { setTerms([]); store(`terms:${pid}`, []); setResp(null); setPins([]); setQueue([]); };
@@ -202,7 +219,7 @@ export default function App() {
     if (proposal.some(p => p.id === c.id)) return setNotice(`${c.code} is already in ${current.name}.`);
     if (taken.includes(c.id)) return setNotice(`${c.code} is already in an approved term.`);
     setNotice('');
-    setProposal([...proposal, resp?.candidates.find(x => x.id === c.id) ?? { id: c.id, reason: 'Added by you', unlocks: [], verified: verified(c.id), source: source[c.id] ?? null }]);
+    setProposal([...proposal, resp?.candidates.find(x => x.id === c.id) ?? { id: c.id, reason: 'Added by you', unlocks: [], verified: verified(c.id), source: source[c.id] ?? null, sections: null }]);
   };
 
   // --- DAG geometry: one band per approved term (top to bottom), then the proposal band, then the queue band ---
@@ -248,6 +265,7 @@ export default function App() {
           unlocks: [],
           verified: verified(id),
           source: source[id] ?? null,
+          sections: null,
         };
 
       updatedProposal = [...updatedProposal, suggestion];
@@ -358,6 +376,14 @@ export default function App() {
                             <button className="min-w-0 flex-1 cursor-pointer text-left" onClick={() => togglePin(p.id)} title={pinned ? 'Pinned — click to unpin' : 'Click to pin for this term'}>
                               <div className="flex items-baseline gap-1.5"><b className="font-semibold">{c?.code}</b><span className="truncate text-ink-2">{c?.name}</span>{pinned && <span className={tag}>pinned</span>}</div>
                               <p className="text-[12px] text-ink-2">{p.reason}</p>
+                              {p.sections
+                                ? <p className={`text-[12px] tabular-nums ${pattern ? 'text-ink-3' : p.sections.some(s => s.status === 'Open') ? 'text-ink-2' : 'text-warning'}`}>
+                                    {pattern && 'usually '}{meets(p.sections[0])}
+                                    {!pattern && p.sections[0].instr && ` · ${p.sections[0].instr}`}
+                                    {p.sections.length > 1 && ` · +${p.sections.length - 1} more`}
+                                    {!pattern && !p.sections.some(s => s.status === 'Open') && ' · all sections full'}
+                                  </p>
+                                : <p className="text-[12px] text-ink-3">no published schedule</p>}
                               {p.unlocks.length > 0 && <p className="text-[12px] text-ink-3">→ unlocks {p.unlocks.slice(0, 5).map(u => courses.get(u)?.code).join(', ')}</p>}
                             </button>
                             <button className={`${icon} h-6 w-6 opacity-0 group-hover:opacity-100 focus-visible:opacity-100`} onClick={() => defer(p.id)} aria-label={`Defer ${c?.code} to a later term`} title="Defer to a later term">›</button>
@@ -375,6 +401,32 @@ export default function App() {
                       </select>
                     </div>
                     <label className={`${btn} mb-1.5 cursor-pointer font-normal text-ink-2`}><input type="checkbox" className="accent-accent" checked={filter.eligible} onChange={e => setFilter({ ...filter, eligible: e.target.checked })} /> Eligible now only</label>
+                    {/* Availability — filters candidates to courses with a section the student can actually attend. */}
+                    <details className="mb-1.5">
+                      <summary className={`${btn} w-full cursor-pointer justify-between font-normal text-ink-2`}>
+                        Availability{availNarrowed && <span className={tag}>on</span>}
+                      </summary>
+                      <div className="mt-1.5 rounded-md border border-line p-2">
+                        <div className="mb-2 flex flex-wrap items-center gap-1 text-[12px] text-ink-2">
+                          <span>No class before</span>
+                          <input type="time" className={`${field} w-26`} aria-label="Earliest class start" value={hhmm(avail.earliest)}
+                            onChange={e => setAvail({ ...avail, earliest: mins(e.target.value) })} />
+                          <span>or after</span>
+                          <input type="time" className={`${field} w-26`} aria-label="Latest class end" value={hhmm(avail.latest)}
+                            onChange={e => setAvail({ ...avail, latest: mins(e.target.value) })} />
+                        </div>
+                        <div className="flex gap-1">
+                          {DAYS.map(([code, lbl]) => {
+                            const off = avail.busy.some(b => b[0] === code);
+                            return <button key={code} aria-pressed={!off} title={off ? `${code}: unavailable` : `${code}: available`}
+                              className={`h-7 flex-1 rounded-md border text-[12px] font-medium transition ${ring} ${off ? 'border-line bg-surface-hover text-ink-3 line-through' : 'border-line-strong text-ink hover:bg-surface-hover'}`}
+                              onClick={() => setAvail({ ...avail, busy: off ? avail.busy.filter(b => b[0] !== code) : [...avail.busy, [code, 0, 24 * 60]] })}>{lbl}</button>;
+                          })}
+                        </div>
+                        <p className="mt-1.5 text-[12px] text-ink-3">Struck-through days are days you can’t attend. Courses with no section that fits are not suggested.</p>
+                        {availNarrowed && <button className={`${btn} mt-1 px-0 text-ink-2`} onClick={() => setAvail(NO_AVAIL)}>Clear availability</button>}
+                      </div>
+                    </details>
                     <input list="cands" placeholder={`+ Add a course (${addable.length})`} value={adding} className={`${field} mb-3 w-full`} aria-label="Add course" onChange={e => { setAdding(e.target.value); add(e.target.value); }} />
                     <datalist id="cands">{addable.map(c => <option key={c.id} value={label(c)}>{resp.candidates.find(x => x.id === c.id)?.reason ?? ''}</option>)}</datalist>
                     <div className="flex flex-wrap gap-1">

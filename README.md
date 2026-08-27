@@ -6,7 +6,8 @@ layered DAG with prerequisite edges.
 
 ```
 python backend/scrape.py        # once: programs + courses from the QC catalog API -> frontend/public/data/*.json
-python backend/prereqs.py       # once: prereq edges from the QC Undergraduate Bulletin PDF (regex; needs pdftotext)
+python backend/prereqs.py       # once: prereq edges from the CUNYfirst requirement groups + catalog text
+python backend/sections.py      # once: real class sections (days/times/instructor/status) from CUNYfirst class search
 python backend/server.py        # suggestion API on :8000   (set GEMINI_API_KEY for AI-picked semesters; otherwise rule-based)
 cd frontend && npm install && npm run dev      # http://localhost:5173  (proxies /api to :8000)
 python backend/test_plan.py     # self-check of the planning logic
@@ -30,7 +31,10 @@ course whose prereqs aren't met and confirm it turns red and blocks Approve.
 
 Optional: `set GEMINI_API_KEY=...` (Windows) / `export GEMINI_API_KEY=...` before step 2 for AI-ordered
 semesters; without it the rule-based picker is used and the response shows `"source": "heuristic"`.
-`test_plan.py` always runs rule-based. `python backend/prereqs.py` additionally needs `pdftotext` (poppler) on PATH.
+`test_plan.py` always runs rule-based.
+
+Refresh `sections.json` once a term, when the registrar publishes the next schedule (`sections_meta.json`
+records when it was last scraped, and the UI shows that date rather than implying the seat status is live).
 
 ## How a semester is suggested
 
@@ -55,8 +59,15 @@ semesters; without it the rule-based picker is used and the response shows `"sou
 
 - Programs/courses: `app.coursedog.com/api/v1/cm/qns01/...` (the catalog site is Coursedog; its HTML has no data).
 - Prerequisites (`backend/prereqs.py`), highest priority first: **CUNYfirst requirement groups** (official requisite
-  text, fetched per course from the catalog API — 1,054 groups), the catalog's requisite field, the 2020-21 Bulletin
-  PDF, then course descriptions. Every prerequisite records its source; 200+ courses with no source are marked
-  "unverified" in the UI. With `GEMINI_API_KEY`, Gemini re-parses the official text and its parse wins.
+  text, fetched per course from the catalog API — 1,054 groups), the catalog's requisite field, then course
+  descriptions. Every prerequisite records its source; 200+ courses with no source are marked "unverified" in the
+  UI. With `GEMINI_API_KEY`, Gemini re-parses the official text and its parse wins.
+  The 2020-21 Bulletin PDF was removed as a source — it supplied 36 of 1,986 prereqs, was the only reason this
+  project needed `pdftotext`, and contradicted the live catalog (see the `prereqs.py` docstring).
+- Sections (`backend/sections.py`): `globalsearch.cuny.edu` (public CUNYfirst class search, institution `QNS01`) —
+  real days, times, room, instructor, instruction mode and open/closed status per section. **This is what makes
+  `offered()` meaningful:** the catalog's own `courseTypicallyOffered` field is the literal string "Fall, Spring"
+  for 3,611 of 3,834 courses, so it could not distinguish a course that runs every term from one last taught in
+  2019. A course with no section in any scraped term is no longer suggested.
 - The approved plan is re-validated on every request (`validate` in `server.py`); violations render red.
 - Pathways course list: `backend/data/gened.csv` (QC approved Gen Ed courses); rules from qc.cuny.edu/academics/gened.

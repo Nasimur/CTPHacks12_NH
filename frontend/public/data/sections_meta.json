@@ -1,0 +1,36 @@
+{
+ "scraped": "2026-08-27",
+ "source": "https://globalsearch.cuny.edu/CFGlobalSearchTool",
+ "season": {
+  "Fall": [
+   "1269"
+  ],
+  "Spring": [
+   "1262"
+  ],
+  "Summer": [
+   "1266"
+  ],
+  "Winter": []
+ },
+ "terms": {
+  "1269": {
+   "name": "2026 Fall Term",
+   "courses": 797,
+   "sections": 1907,
+   "unmatched_codes": 29
+  },
+  "1266": {
+   "name": "2026 Summer Term",
+   "courses": 174,
+   "sections": 267,
+   "unmatched_codes": 3
+  },
+  "1262": {
+   "name": "2026 Spring Term",
+   "courses": 823,
+   "sections": 1939,
+   "unmatched_codes": 16
+  }
+ }
+}

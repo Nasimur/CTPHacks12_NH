@@ -15,12 +15,13 @@ python backend/test_plan.py     # self-check of the planning logic
 
 ## Setup & testing (teammates)
 
-Needs **Python 3.10+** (stdlib only, nothing to `pip install`) and **Node 20+**. The catalog data in
+Needs **Python 3.10+** (`python -m pip install -r backend/requirements.txt` for DegreeWorks PDF import) and **Node 20+**. The catalog data in
 `frontend/public/data/` is committed, so skip the scrape/prereq steps unless you're refreshing it.
 
 ```
 git clone <repo-url> && cd hack
-python backend/test_plan.py          # 1. self-check: should print three "... OK" lines and exit 0
+python -m pip install -r backend/requirements.txt  # needed for DegreeWorks PDF import
+python backend/test_plan.py          # 1. self-check: should print "... OK" lines and exit 0
 python backend/server.py             # 2. API on http://localhost:8000 (leave running)
 cd frontend && npm install && npm run dev   # 3. UI on http://localhost:5173, in a second terminal
 ```

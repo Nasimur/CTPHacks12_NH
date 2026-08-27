@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, MotionConfig, motion } from 'motion/react';
-import type { Availability, Course, Prereqs, Program, Section, SuggestResponse, Suggestion, Term } from './types';
+import type { AuditImport, Availability, Course, Prereqs, Program, Section, SuggestResponse, Suggestion, Term } from './types';
 import { DEGREE_CREDITS, GEOM, bandH, nextTerm, pos } from './plan';
 import './App.css';
 
@@ -74,9 +74,11 @@ export default function App() {
   const [error, setError] = useState('');
   const [focus, setFocus] = useState<string | null>(null);
   const [adding, setAdding] = useState('');
+  const [importing, setImporting] = useState(false);
   const [left, setLeft] = useState<boolean>(() => store('ui:left') ?? true);
   const [right, setRight] = useState<boolean>(() => store('ui:right') ?? true);
   const [view, setView] = useState({ x: 0, y: 0, s: 1 });          // diagram pan/zoom
+  const auditInput = useRef<HTMLInputElement>(null);
   const canvas = useRef<HTMLDivElement>(null);
   const drag = useRef<{ px: number; py: number; x: number; y: number } | null>(null);
   const draggedCourse = useRef<DraggedCourse | null>(null);
@@ -235,6 +237,34 @@ export default function App() {
     setNotice('');
     setProposal([...proposal, resp?.candidates.find(x => x.id === c.id) ?? { id: c.id, reason: 'Added by you', unlocks: [], verified: verified(c.id), source: source[c.id] ?? null, sections: null }]);
   };
+  const importAudit = async (file: File | null) => {
+    if (!file) return;
+    setImporting(true); setError(''); setNotice('');
+    try {
+      const body = new FormData();
+      body.append('audit', file);
+      const r = await fetch('/api/audit', { method: 'POST', body });
+      const audit = await r.json() as AuditImport;
+      if (!r.ok || audit.error) throw new Error(audit.error || `${r.status}`);
+      if (!audit.program) throw new Error(`Could not match "${audit.major ?? 'audit major'}" to a planner major.`);
+      store('program', audit.program);
+      store(`terms:${audit.program}`, audit.terms);
+      store(`pins:${audit.program}`, []);
+      store(`queue:${audit.program}`, []);
+      setPid(audit.program);
+      setTerms(audit.terms);
+      setPins([]);
+      setQueue([]);
+      setProposal([]);
+      setResp(null);
+      setNotice(`Imported ${audit.courses.length} completed courses from ${audit.major ?? 'DegreeWorks'}.`);
+    } catch (e) {
+      setError(`DegreeWorks import failed (${e instanceof Error ? e.message : 'unknown error'}).`);
+    } finally {
+      setImporting(false);
+      if (auditInput.current) auditInput.current.value = '';
+    }
+  };
 
   // --- DAG geometry: one band per approved term (top to bottom), then the proposal band, then the queue band ---
   const levels: { name: string; kind: string; ids: string[]; proposed?: boolean; queued?: boolean }[] = [
@@ -308,6 +338,7 @@ export default function App() {
   const H = GEOM.PAD * 2 + Math.max(1, levels.length) * (bandH + GEOM.ROW_GAP) - GEOM.ROW_GAP;
   const at = (id: string) => { const p = place.get(id)!; return pos(p.level, p.i, levels[p.level].ids.length, W); };
   const proposalCredits = credits(proposal.map(p => p.id));
+  const courseCodes = (ids: string[]) => ids.map(id => courses.get(id)?.code ?? id).join(' or ');
   const hot = focus ? new Set([focus, ...(prereqs[focus] ?? []).flat(), ...(resp?.candidates.find(c => c.id === focus)?.unlocks ?? [])]) : null;
   const violations = new Map((resp?.violations ?? []).map(v => [v.id, v]));
   const unverified = new Set([...place.keys()].filter(id => courses.has(id) && !verified(id)));
@@ -349,6 +380,10 @@ export default function App() {
           <input list="programs" placeholder="Search a major…" defaultValue={program ? `${program.name} (${program.degree})` : ''} className={`${field} w-full max-w-sm`} aria-label="Major"
             onChange={e => { const p = programs.find(p => `${p.name} (${p.degree})` === e.target.value); if (p) setPid(p.id); }} />
           <datalist id="programs">{programs.map(p => <option key={p.id} value={`${p.name} (${p.degree})`} />)}</datalist>
+          <input ref={auditInput} type="file" accept="application/pdf,.pdf" className="hidden" onChange={e => importAudit(e.target.files?.[0] ?? null)} />
+          <button className={btn} onClick={() => auditInput.current?.click()} disabled={importing} title="Import completed courses from a DegreeWorks PDF">
+            {importing ? 'Importing…' : 'Import audit'}
+          </button>
           <label className={`${btn} cursor-pointer font-normal text-ink-2`}><input type="checkbox" className="accent-accent" checked={breaks} onChange={e => setBreaks(e.target.checked)} /> Summer / Winter</label>
           <div className="ml-auto flex items-center gap-3 text-[13px]">
             <span className="text-ink-2 tabular-nums">{terms.length} {terms.length === 1 ? 'term' : 'terms'}</span>
@@ -722,7 +757,8 @@ export default function App() {
                         <span className={`text-[12px] tabular-nums ${m.have >= m.need ? 'text-success' : 'text-ink-2'}`}>{m.have}/{m.need} {m.unit}</span>
                       </summary>
                       <ul className="mb-1 columns-2 pl-7 pr-2 text-[12px] text-ink-2">
-                        {m.missing.slice(0, 24).map((o, i) => <li key={i}>{o.map(id => courses.get(id)?.code ?? id).join(' or ')}</li>)}
+                        {(m.completed ?? []).map((o, i) => <li key={`done:${i}`} className="text-success line-through decoration-success/70 decoration-2">{courseCodes(o)}</li>)}
+                        {m.missing.slice(0, 24).map((o, i) => <li key={`todo:${i}`}>{courseCodes(o)}</li>)}
                         {m.missing.length > 24 && <li>… {m.missing.length - 24} more</li>}
                       </ul>
                     </details>
@@ -732,7 +768,7 @@ export default function App() {
                     <li key={s.slot} className={`flex items-center gap-2 rounded-md px-2 py-1 text-[13px] transition hover:bg-surface-hover ${s.course ? 'text-ink' : 'text-ink-2'}`}>
                       <span className={`h-1.5 w-1.5 rounded-full ${s.course ? 'bg-success' : 'bg-line-strong'}`} aria-hidden="true" />
                       <span className="flex-1">{s.label}</span>
-                      {s.course && <b className="font-medium tabular-nums">{courses.get(s.course)?.code}</b>}
+                      {s.course && <b className="font-medium tabular-nums text-success">{courses.get(s.course)?.code}</b>}
                     </li>
                   ))}</ul>
                 </>}

@@ -13,6 +13,10 @@ export type Section = {
   sec: string; component: string; days: string; start: number | null; end: number | null;
   extra: { days: string; start: number; end: number }[];
   room: string; instr: string; mode: string; status: string; raw: string;
+  rmp?: {
+    name: string; rating: number; difficulty: number; reviews: number; wouldTakeAgain: number | null;
+    department: string; legacyId: number; score: number;
+  };
 };
 /** The student's weekly availability. Days are the 2-char CUNYfirst tokens: Mo Tu We Th Fr Sa Su. */
 export type Availability = { busy: [string, number, number][]; earliest: number; latest: number };

@@ -8,6 +8,7 @@ layered DAG with prerequisite edges.
 python backend/scrape.py        # once: programs + courses from the QC catalog API -> frontend/public/data/*.json
 python backend/prereqs.py       # once: prereq edges from the CUNYfirst requirement groups + catalog text
 python backend/sections.py      # once: real class sections (days/times/instructor/status) from CUNYfirst class search
+python backend/rmp.py           # periodically: cached Queens College professor rating summaries from unofficial RMP GraphQL
 python backend/server.py        # suggestion API on :8000   (set GEMINI_API_KEY for AI-picked semesters; otherwise rule-based)
 cd frontend && npm install && npm run dev      # http://localhost:5173  (proxies /api to :8000)
 python backend/test_plan.py     # self-check of the planning logic
@@ -70,5 +71,9 @@ records when it was last scraped, and the UI shows that date rather than implyin
   `offered()` meaningful:** the catalog's own `courseTypicallyOffered` field is the literal string "Fall, Spring"
   for 3,611 of 3,834 courses, so it could not distinguish a course that runs every term from one last taught in
   2019. A course with no section in any scraped term is no longer suggested.
+- Professor ratings (`backend/rmp.py`): unofficial Rate My Professors GraphQL data for CUNY Queens College only
+  (RMP school ID `231`). Sections are ordered by a confidence-adjusted rating with a 20-review Queens College prior,
+  so a tiny perfect sample does not outrank a strong professor with many reviews. The UI always shows the raw rating
+  and review count, links no review text, and keeps the last snapshot if a refresh fails.
 - The approved plan is re-validated on every request (`validate` in `server.py`); violations render red.
 - Pathways course list: `backend/data/gened.csv` (QC approved Gen Ed courses); rules from qc.cuny.edu/academics/gened.

@@ -334,6 +334,30 @@ def multipart_file(headers, data):
 sections = json.loads((DATA / "sections.json").read_text(encoding="utf8")) if (DATA / "sections.json").exists() else {}
 _meta = json.loads((DATA / "sections_meta.json").read_text(encoding="utf8")) if (DATA / "sections_meta.json").exists() else {}
 SEASON = _meta.get("season", {})              # {"Fall": ["1269"], ...} -- term ids live in sections.py
+rmp_snapshot = json.loads((DATA / "rmp.json").read_text(encoding="utf8")) if (DATA / "rmp.json").exists() else {}
+rmp_professors = rmp_snapshot.get("professors", {})
+
+
+def instructor_key(name):
+    return re.sub(r"[^a-z0-9]", "", name.casefold())
+
+
+def rated_sections(items):
+    """Attach cached RMP aggregates and put stronger, better-supported professors first."""
+    enriched = []
+    for section in items:
+        section = dict(section)
+        rating = rmp_professors.get(instructor_key(section.get("instr", "")))
+        if rating:
+            section["rmp"] = rating
+        enriched.append(section)
+    return sorted(enriched, key=lambda section: (
+        section.get("status") != "Open",
+        -section.get("rmp", {}).get("score", -1),
+        -section.get("rmp", {}).get("reviews", 0),
+        section.get("start") is None,
+        section.get("start") or 0,
+    ))
 
 # ---- Pathways (CUNY general education) -----------------------------------------------------------
 AREA = {"English Composition": "EC", "Mathematical&QuantitativeReasoning": "MQR", "Life and Physical Sciences": "LPS",
@@ -597,7 +621,7 @@ def available(cid, term, avail):
     secs = sections_for(cid, term)
     if not secs:
         return None
-    return [s for s in secs if fits(s, avail)] if avail else secs
+    return rated_sections([s for s in secs if fits(s, avail)] if avail else secs)
 
 
 def map_rank(program, cid):

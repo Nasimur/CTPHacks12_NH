@@ -3,9 +3,24 @@ import os
 from pathlib import Path
 os.environ.pop("GEMINI_API_KEY", None)          # deterministic: rule-based picker only
 import server as s
+from rmp import confidence_score
 
 by_code = s.by_code
 cs = lambda *codes: [by_code[c] for c in codes]
+
+# RMP confidence: a substantial 4.6 record outranks a perfect two-review profile.
+assert confidence_score(4.6, 80, 3.5) > confidence_score(5.0, 2, 3.5)
+old = s.rmp_professors
+s.rmp_professors = {
+    "newprof": {"rating": 5.0, "reviews": 2, "score": confidence_score(5.0, 2, 3.5)},
+    "establishedprof": {"rating": 4.6, "reviews": 80, "score": confidence_score(4.6, 80, 3.5)},
+}
+ranked = s.rated_sections([
+    {"instr": "New Prof", "status": "Open", "start": 600},
+    {"instr": "Established Prof", "status": "Open", "start": 700},
+])
+assert ranked[0]["instr"] == "Established Prof" and ranked[0]["rmp"]["reviews"] == 80
+s.rmp_professors = old
 
 # prereq logic: CSCI 220 needs MATH 120 AND (MATH 151 or 141) AND CSCI 111; MATH 151's precalc prereq is placement
 assert s.prereqs_met(by_code["MATH 151"], set())

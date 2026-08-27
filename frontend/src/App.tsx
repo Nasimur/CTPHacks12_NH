@@ -459,6 +459,7 @@ export default function App() {
                                 ? <p className={`text-[12px] tabular-nums ${pattern ? 'text-ink-3' : p.sections.some(s => s.status === 'Open') ? 'text-ink-2' : 'text-warning'}`}>
                                     {pattern && 'usually '}{meets(p.sections[0])}
                                     {!pattern && p.sections[0].instr && ` · ${p.sections[0].instr}`}
+                                    {!pattern && p.sections[0].rmp && ` · ${p.sections[0].rmp.rating.toFixed(1)} ★ (${p.sections[0].rmp.reviews} reviews)`}
                                     {p.sections.length > 1 && ` · +${p.sections.length - 1} more`}
                                     {!pattern && !p.sections.some(s => s.status === 'Open') && ' · all sections full'}
                                   </p>

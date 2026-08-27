@@ -24,7 +24,7 @@ export type Suggestion = {
 export type Violation = { id: string; term: number; missing: string[] };
 export type Progress = {
   credits: number;
-  major: { name: string; have: number; need: number; unit: string; set: string | null; missing: string[][] }[];
+  major: { name: string; have: number; need: number; unit: string; set: string | null; completed?: string[][]; missing: string[][] }[];
   pathways: { slot: string; label: string; course: string | null }[];
 };
 export type SuggestResponse = {
@@ -32,4 +32,12 @@ export type SuggestResponse = {
   /** basis='published': the registrar has released this term's schedule. 'pattern': same season, a year on —
    *  a fair guide to when a course usually meets, but not a booking. null: no section data scraped. */
   schedule: { basis: 'published' | 'pattern'; scraped: string } | null;
+};
+export type AuditImport = {
+  program: string | null;
+  major: string | null;
+  degree: string | null;
+  terms: Term[];
+  courses: { id: string; code: string; grade: string; credits: number; term: Term['kind']; year: number }[];
+  error?: string;
 };

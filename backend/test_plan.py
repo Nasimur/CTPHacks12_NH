@@ -18,6 +18,25 @@ assert {"ENGL 110", "CSCI 111"} <= codes, codes
 assert len(r["suggested"]) >= s.MIN_COURSES and s.TARGET_CREDITS <= sum(s.courses[x["id"]]["credits"] for x in r["suggested"]) <= s.MAX_CREDITS
 assert by_code["CSCI 211"] in next(x for x in r["suggested"] if s.courses[x["id"]]["code"] == "CSCI 111")["unlocks"]
 
+progress = s.suggest({"program": "CSCI-BS", "terms": [cs("CSCI 111", "MATH 151")], "term": "Spring", "fresh": True})["progress"]
+core = next(m for m in progress["major"] if m["name"] == "Major Requirements - Core")
+math = next(m for m in progress["major"] if m["name"] == "Major Requirements - Math")
+assert [by_code["CSCI 111"]] in core["completed"], core
+assert [by_code["MATH 151"]] in math["completed"], math
+audit = s.parse_degreeworks_text("""Degree Bachelor of Arts (BA)
+Audit date 08/24/2026
+Major Computer Science BA   Concentration None
+Algorithmic Problem Solving I CSCI 111 Intro Algorithmic Problem Solv B+ 3 FALL 2023
+Object Oriented Programming in C++ CSCI 211 Object-Oriented Program in C++ B+ 3 SPRING 2024
+Database Systems CSCI 331 Database Systems IP (3) FALL 2026
+Software Engineering CSCI 370 Software Engineering W 0 SPRING 2026
+CSCI 320 Theory of Computation F 0 FALL 2025
+""")
+assert audit["program"] == "CSCI-BA", audit
+assert [t["name"] for t in audit["terms"]] == ["Fall 2023", "Spring 2024"], audit["terms"]
+assert audit["terms"][0]["courses"] == cs("CSCI 111") and audit["terms"][1]["courses"] == cs("CSCI 211"), audit["terms"]
+assert {c["code"] for c in audit["courses"]} == {"CSCI 111", "CSCI 211"}, audit["courses"]
+
 # Pathways: one course fills one slot; ENGL 110 only fits EC1; CSCI 111 (SW + College Option Science) goes to College Option
 p = {x["slot"]: x["course"] for x in s.pathways(set(cs("ENGL 110", "CSCI 111")))}
 assert p["EC1"] == by_code["ENGL 110"] and p["SCI"] == by_code["CSCI 111"] and p["SW"] is None and p["EC2"] is None, p

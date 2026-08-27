@@ -1,4 +1,4 @@
-"""Semester suggestion API. Stdlib only.
+"""Semester suggestion API.
 
     python backend/server.py            # http://localhost:8000
 
@@ -12,6 +12,7 @@ the eligible set, and its picks go through the same guards as the rule-based pic
 partner, one course per Pathways slot). Responses are cached per input; "fresh" bypasses the cache (Regenerate).
 """
 import csv, json, os, re, urllib.request
+from io import BytesIO
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -32,6 +33,87 @@ for _p in programs.values():                                   # a course requir
 coreqs = set(json.loads((DATA / "coreqs.json").read_text())) if (DATA / "coreqs.json").exists() else set()
 source = json.loads((DATA / "prereq_source.json").read_text()) if (DATA / "prereq_source.json").exists() else {}   # provenance
 by_code = {c["code"]: c["id"] for c in courses.values()}
+
+TERM_ORDER = {"Winter": 0, "Spring": 1, "Summer": 2, "Fall": 3}
+NON_COMPLETION_GRADES = {"F", "FIN", "W", "WA", "WD", "WN", "WU", "INC", "IP", "NC", "AUD"}
+COURSE_ROW = re.compile(
+    r"\b([A-Z]{2,5})\s+(\d{1,4}[A-Z]?)\b\s+(.+?)\s+"
+    r"([A-F][+-]?|FIN|P|CR|S|IP|W|WA|WD|WN|WU|INC|NC|AUD)\s+"
+    r"(?:\((\d+(?:\.\d+)?)\)|(\d+(?:\.\d+)?))\s+"
+    r"(FALL|SPRING|SUMMER|WINTER)\s+(\d{4})"
+)
+
+
+def norm(s):
+    return re.sub(r"[^a-z0-9]+", "", s.lower())
+
+
+def program_from_audit(text):
+    major = re.search(r"\bMajor\s+(.+?)\s+Concentration\b", text)
+    degree = re.search(r"\bDegree\s+(.+?)\s+Audit date\b", text)
+    major_label = major.group(1).strip() if major else ""
+    degree_label = degree.group(1).strip() if degree else ""
+    abbr = next((a for a in ("BA", "BS", "BBA", "BFA", "BM", "MA", "MS") if re.search(rf"\b{a}\b", f"{major_label} {degree_label}")), "")
+    major_name = re.sub(r"\b(BA|BS|BBA|BFA|BM|MA|MS)\b", "", major_label).strip()
+    for pid, p in programs.items():
+        if abbr and not pid.endswith(f"-{abbr}"):
+            continue
+        if norm(p["name"]) and norm(p["name"]) in norm(major_name or major_label):
+            return pid, major_label, degree_label
+    return None, major_label, degree_label
+
+
+def parse_degreeworks_text(text):
+    program_id, major_label, degree_label = program_from_audit(text)
+    seen, parsed, grouped = set(), [], {}
+    for line in text.splitlines():
+        for m in COURSE_ROW.finditer(line):
+            code = f"{m.group(1)} {m.group(2)}"
+            cid = by_code.get(code)
+            if not cid:
+                continue
+            grade = m.group(4)
+            credits = float(m.group(5) or m.group(6) or 0)
+            if grade in NON_COMPLETION_GRADES or credits <= 0:
+                continue
+            term = m.group(7).title()
+            year = int(m.group(8))
+            key = (year, TERM_ORDER[term])
+            grouped.setdefault(key, {"name": f"{term} {year}", "kind": term, "courses": []})
+            if (cid, key) not in seen:
+                grouped[key]["courses"].append(cid)
+                seen.add((cid, key))
+            parsed.append({"id": cid, "code": code, "grade": grade, "credits": credits, "term": term, "year": year})
+    return {
+        "program": program_id,
+        "major": major_label or None,
+        "degree": degree_label or None,
+        "terms": [grouped[k] for k in sorted(grouped)],
+        "courses": parsed,
+    }
+
+
+def extract_audit_pdf(data):
+    try:
+        from pypdf import PdfReader
+    except ImportError as e:
+        raise RuntimeError("Install pypdf first: python -m pip install -r backend/requirements.txt") from e
+    reader = PdfReader(BytesIO(data))
+    return "\n".join(page.extract_text() or "" for page in reader.pages)
+
+
+def multipart_file(headers, data):
+    content_type = headers.get("content-type", "")
+    m = re.search(r"boundary=(?:\"([^\"]+)\"|([^;]+))", content_type)
+    if not m:
+        return None
+    boundary = ("--" + (m.group(1) or m.group(2))).encode()
+    for part in data.split(boundary):
+        if b"filename=" not in part or b"\r\n\r\n" not in part:
+            continue
+        _, _, body = part.partition(b"\r\n\r\n")
+        return body.rsplit(b"\r\n", 1)[0]
+    return None
 
 # Real class sections from CUNYfirst (backend/sections.py): {termId: {courseId: [section...]}}.
 sections = json.loads((DATA / "sections.json").read_text(encoding="utf8")) if (DATA / "sections.json").exists() else {}
@@ -117,15 +199,16 @@ def major_progress(program, taken):
     out = []
     for req in program["requirements"]:
         have = need = 0
-        missing = []   # options (OR-groups) still open
+        completed, missing = [], []   # completed/todo options (OR-groups)
         for rule in req["rules"]:
             sat = [o for o in rule["options"] if any(i in taken for i in o)]
             need += rule["n"]
             have += sum(courses[next(i for i in o if i in taken)]["credits"] for o in sat) if rule["kind"] == "credits" else min(len(sat), rule["n"])
+            completed += [[i for i in o if i in taken] for o in sat]
             if have < need:
                 missing += [o for o in rule["options"] if o not in sat]
         out.append({"name": req["name"], "have": have, "need": need, "set": next((r["set"] for r in req["rules"] if r.get("set")), None),
-                    "unit": "credits" if any(r["kind"] == "credits" for r in req["rules"]) else "courses", "missing": missing})
+                    "unit": "credits" if any(r["kind"] == "credits" for r in req["rules"]) else "courses", "completed": completed, "missing": missing})
     return out
 
 
@@ -452,7 +535,16 @@ class Handler(BaseHTTPRequestHandler):
         self._send({"error": "not found"}, 404)
 
     def do_POST(self):
-        body = json.loads(self.rfile.read(int(self.headers.get("content-length", 0)) or b"{}"))
+        raw = self.rfile.read(int(self.headers.get("content-length", 0)) or 0)
+        if self.path == "/api/audit":
+            try:
+                pdf = multipart_file(self.headers, raw)
+                if not pdf:
+                    return self._send({"error": "Upload a DegreeWorks PDF."}, 400)
+                return self._send(parse_degreeworks_text(extract_audit_pdf(pdf)))
+            except Exception as e:
+                return self._send({"error": str(e)}, 400)
+        body = json.loads(raw or b"{}")
         if self.path == "/api/suggest" and body.get("program") in programs:
             return self._send(suggest(body))
         self._send({"error": "bad request"}, 400)

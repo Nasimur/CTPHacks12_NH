@@ -2,23 +2,28 @@
 
   0. CUNYfirst requirement groups (official; via the catalog API)   "PREQ: CSCI 313 AND MATH 231 with min grade of C"
   1. the current catalog's requisite text (customFields.Mmgow)        "Prereq.: C- or above in MATH 141 or 151."
-  2. the 2020-21 QC Undergraduate Bulletin PDF                        "CSCI 313. Data Structures. ... Prereq.: CSCI 211, 212, and 220."
-  3. course descriptions                                              "builds on the work of English 110"
+  2. course descriptions                                              "builds on the work of English 110"
 A regex parser handles the common forms with no API key. With GEMINI_API_KEY set, Gemini re-parses every
-requirement group and bulletin entry (and remaining prereq-less descriptions); its answer wins.
+requirement group (and remaining prereq-less descriptions); its answer wins.
 Ends with an audit of courses whose text names another course but got no prerequisite.
+
+The 2020-21 Undergraduate Bulletin PDF used to sit between 1 and 2. It was dropped: it supplied only 36 of
+1,986 prereq sources (CUNYfirst supplies 1,937), it was the sole reason this project needed `pdftotext`,
+and being five years stale it contradicted the live catalog -- it claimed ACCT 100 requires BALA 100 (the
+catalog says "BALA Minors Only", not a course) and that MATH 317 requires MATH 201 (the catalog says any
+math course 200 or above), both false constraints enforced against students. Courses the live catalog is
+silent about now fall through to `verified()` in server.py, which flags 200+ courses with no known
+prerequisite for an advisor to confirm -- an honest "we don't know" beats a stale guess.
 
 Usage:  python backend/prereqs.py   -> frontend/public/data/prereqs.json         {courseId: [[prereqId,...] (OR-group), ...]}
                                        frontend/public/data/coreqs.json          [courseId...]  may be taken the same term
-                                       frontend/public/data/prereq_source.json   {courseId: "cunyfirst"|"catalog"|"bulletin"|"description"|"gemini"}
-Needs `pdftotext` on PATH (Git for Windows ships one). Stdlib only otherwise.
+                                       frontend/public/data/prereq_source.json   {courseId: "cunyfirst"|"catalog"|"description"|"gemini"}
+Stdlib only.
 """
-import json, os, re, subprocess, sys, urllib.error, urllib.request
+import json, os, re, sys, urllib.error, urllib.request
 from pathlib import Path
 
 DATA = Path(__file__).resolve().parent.parent / "frontend" / "public" / "data"
-CACHE = Path(__file__).resolve().parent / "cache"
-BULLETIN = "https://coursedog-static-public.s3.us-east-2.amazonaws.com/qns01/Adm_Undergraduate_Bulletin_2020_2021%20%283%29.pdf"
 MODEL = "gemini-3.6-flash"
 BATCH = 60
 PROMPT = """Each line below is "<id> | <course requisite text>" from a college catalog.
@@ -32,7 +37,6 @@ Return ONLY JSON: {"<id>": {"pre": [["CSCI 313"], ["MATH 231"]], "co": [["MATH 1
 - Omit lines with no course codes.
 
 """
-ENTRY = re.compile(r"^([A-Z]{2,5}) (\d+[A-Z]*)\. .*?((?:Prereq|[Cc]oreq)[^:]*):\s*(.*)")
 CODE = re.compile(r"\b([A-Z]{2,5})? ?(\d{2,4}[A-Z]?)\b")
 LABEL = re.compile(r"(PRE\s*/\s*CO(?:REQ)?|PREREQ|PREQ|PRE|Prereq\.?|COREQ|CO)\s*:", re.I)
 ALIAS = {"english": "ENGL", "mathematics": "MATH", "math": "MATH", "computer science": "CSCI", "physics": "PHYS",
@@ -92,17 +96,6 @@ def gemini_batches(items):
         print(f"  gemini {min(i + BATCH, len(items))}/{len(items)}")
 
 
-def bulletin_lines():
-    CACHE.mkdir(exist_ok=True)
-    pdf, txt = CACHE / "bulletin.pdf", CACHE / "bulletin.txt"
-    if not txt.exists():
-        if not pdf.exists():
-            print("downloading bulletin...")
-            urllib.request.urlretrieve(BULLETIN, pdf)
-        subprocess.run(["pdftotext", str(pdf), str(txt)], check=True)   # reading order: one course per line
-    return txt.read_text(encoding="utf8", errors="ignore").splitlines()
-
-
 def resolve(groups, by_code):
     out = [[by_code[p] for p in g if p in by_code] for g in groups if isinstance(g, list)]
     return [g for g in out if g]
@@ -126,7 +119,7 @@ if __name__ == "__main__":
             return True
         return False
 
-    # ---- 3) descriptions (lowest priority; applied first, overwritten by better sources) -------------------
+    # ---- 2) descriptions (lowest priority; applied first, overwritten by better sources) -------------------
     from_desc = 0
     for c in courses:
         text = c["description"]
@@ -136,16 +129,6 @@ if __name__ == "__main__":
         if m and record(c["id"], parse_clause(m.group(1), None), [], "description"):
             from_desc += 1
     print(f"descriptions: {from_desc}")
-
-    # ---- 2) 2020-21 bulletin ------------------------------------------------------------------------------
-    entries = [(m, line[:700]) for line in bulletin_lines() if (m := ENTRY.match(line))]
-    n = 0
-    for m, _ in entries:
-        code = f"{m.group(1)} {m.group(2)}"
-        if code in by_code:
-            groups = parse_clause(m.group(4), m.group(1))
-            n += record(by_code[code], [] if "coreq" in m.group(3).lower() else groups, groups if "coreq" in m.group(3).lower() else [], "bulletin")
-    print(f"bulletin: {n} of {len(entries)} entries")
 
     # ---- 1) current catalog requisite text ------------------------------------------------------------------
     n = 0

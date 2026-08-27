@@ -53,6 +53,13 @@ Exit = same easing, opacity-led, never longer than enter. `prefers-reduced-motio
 - **Field** (`field`): 28px, `line` border → `line-strong` hover → `accent` focus.
 - **Course card**: white, `line` border, `md` radius; proposed = dashed `line-strong`; violation = `danger` border + `danger-soft` fill; focused = `accent` border.
 - **Term band**: approved = `surface` fill, no border; proposed = `accent-soft` fill, dashed `line-strong`; break term = `success-soft`.
+- **Section line** (proposal card, under the reason): 12px `tabular-nums`, `MW 1:40PM–2:30PM · Instructor · +3 more`.
+  `ink-2` normally; `warning` when every fitting section is full; `ink-3` and prefixed *usually* once the term is
+  past the published schedule (a season pattern, not a booking); `ink-3` "no published schedule" when unknown.
+  Never render a pattern time in `ink-2` — the colour is the only thing separating a fact from an estimate.
+- **Availability control**: a `<details>` in the left panel. Two native `<input type="time">` fields (`field`, `w-26`)
+  and five day toggles — 28px, `line-strong` border when available, `surface-hover` + `ink-3` + strike-through when
+  not. An `on` badge (`tag`) in the summary whenever anything is narrowed, plus a ghost "Clear availability".
 
 ## Layout
 `header (44px)` / `[left 320px | diagram flex-1 | right 320px]`. Left = approval, right = requirements + Pathways. Panels toggle with header buttons, `Ctrl/⌘+[` and `Ctrl/⌘+]`; state persisted in `localStorage` (`ui:left`, `ui:right`).

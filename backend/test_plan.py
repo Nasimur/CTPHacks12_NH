@@ -73,3 +73,54 @@ r = s.suggest({"program": "CSCI-BS", "terms": [cs("ENGL 110", "MATH 151", "CSCI 
 w = [x for x in r["candidates"] if x["reason"] == "Writing Intensive requirement"]
 assert all(s.level(a["id"]) <= s.level(b["id"]) for a, b in zip(w, w[1:])), [s.courses[x["id"]]["code"] for x in w[:5]]
 print("pathways matching + W OK")
+
+# ---- schedules & availability (backend/sections.py) ---------------------------------------------------
+if s.sections:
+    # offered() is now driven by real sections, not the catalog's "Fall, Spring" prose
+    everywhere = {cid for t in s.sections for cid in s.sections[t]}
+    fall = set(s.sections.get(s.SEASON["Fall"][0], {}))
+    assert fall, "no Fall sections scraped"
+    assert s.offered(by_code["CSCI 111"], "Fall")
+    off_season = next((c for c in everywhere - fall), None)       # runs at QC, but not in the Fall
+    assert off_season is None or not s.offered(off_season, "Fall"), s.courses[off_season]["code"]
+    # a course absent from EVERY scraped term keeps the old prose fallback rather than vanishing
+    ghost = next((c for c in s.courses if c not in everywhere), None)
+    assert ghost is None or s.offered(ghost, "Fall") == s.offered_text(ghost, "Fall")
+    # ...and that fallback is load-bearing: CS electives rotate across years, so "no section scraped" must
+    # never mean "not offered". If this fires, offered() was tightened and the major lost elective options.
+    rotating = [c for c in cs("CSCI 310", "CSCI 335", "CSCI 365", "CSCI 383") if c not in everywhere]
+    assert all(s.offered(c, "Fall") for c in rotating), [s.courses[c]["code"] for c in rotating]
+
+    # a section that clashes with a busy block does not fit; one with no meeting time always does
+    secs = [x for x in s.sections_for(by_code["CSCI 111"], "Fall") if x["start"] is not None]
+    assert secs, "CSCI 111 has no timed Fall section"
+    one = secs[0]
+    busy = {"busy": [[one["days"][:2], one["start"], one["end"]]], "earliest": 0, "latest": 24 * 60}
+    assert not s.fits(one, busy)
+    assert s.fits(one, {"busy": [[one["days"][:2], one["end"], one["end"] + 30]], "earliest": 0, "latest": 24 * 60})
+    assert s.fits({"start": None, "end": None, "days": "", "extra": []}, busy)
+
+    # a course whose every section falls inside the busy window is dropped from the candidate list
+    all_secs = s.sections_for(by_code["CSCI 111"], "Fall")
+    block = {"busy": [[d, 0, 24 * 60] for d in ("Mo", "Tu", "We", "Th", "Fr", "Sa", "Su")], "earliest": 0, "latest": 24 * 60}
+    if all(x["start"] is not None for x in all_secs):
+        assert s.available(by_code["CSCI 111"], "Fall", block) == []
+        blocked_ids = {c["id"] for c in s.candidates(s.programs["CSCI-BS"], set(), "Fall", block)[0]}
+        assert by_code["CSCI 111"] not in blocked_ids
+
+    # the filter is INERT when the student has narrowed nothing: same term as with no availability at all
+    wide = {"busy": [], "earliest": 0, "latest": 24 * 60}
+    base = [x["id"] for x in s.suggest({"program": "CSCI-BS", "terms": [], "term": "Fall"})["suggested"]]
+    same = [x["id"] for x in s.suggest({"program": "CSCI-BS", "terms": [], "term": "Fall", "avail": wide})["suggested"]]
+    assert base == same, (base, same)
+
+    # a real narrowing changes nothing structural: still a legal, prereq-valid term
+    late = {"busy": [], "earliest": 11 * 60, "latest": 22 * 60}
+    r = s.suggest({"program": "CSCI-BS", "terms": [], "term": "Fall", "avail": late})
+    for x in r["suggested"]:
+        for sec in (x["sections"] or []):
+            assert sec["start"] is None or sec["start"] >= 11 * 60, (s.courses[x["id"]]["code"], sec)
+    assert not s.validate([[x["id"] for x in r["suggested"]]])
+    print("schedules + availability OK")
+else:
+    print("schedules SKIPPED (run: python backend/sections.py)")

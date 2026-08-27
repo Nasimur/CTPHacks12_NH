@@ -33,6 +33,11 @@ coreqs = set(json.loads((DATA / "coreqs.json").read_text())) if (DATA / "coreqs.
 source = json.loads((DATA / "prereq_source.json").read_text()) if (DATA / "prereq_source.json").exists() else {}   # provenance
 by_code = {c["code"]: c["id"] for c in courses.values()}
 
+# Real class sections from CUNYfirst (backend/sections.py): {termId: {courseId: [section...]}}.
+sections = json.loads((DATA / "sections.json").read_text(encoding="utf8")) if (DATA / "sections.json").exists() else {}
+_meta = json.loads((DATA / "sections_meta.json").read_text(encoding="utf8")) if (DATA / "sections_meta.json").exists() else {}
+SEASON = _meta.get("season", {})              # {"Fall": ["1269"], ...} -- term ids live in sections.py
+
 # ---- Pathways (CUNY general education) -----------------------------------------------------------
 AREA = {"English Composition": "EC", "Mathematical&QuantitativeReasoning": "MQR", "Life and Physical Sciences": "LPS",
         "World Cultures": "WCGI", "US Experience": "USED", "Creative Expression": "CE",
@@ -162,9 +167,59 @@ def prereqs_met(cid, taken):
     return all(any(p in taken for p in group) or placement(group) for group in prereqs.get(cid, []))
 
 
-def offered(cid, term):
+def offered_text(cid, term):
+    """The catalog's `courseTypicallyOffered` prose. Nearly worthless on its own -- it is the literal string
+    "Fall, Spring" for 3,611 of 3,834 courses -- so it is only the last resort in offered() below."""
     o = courses[cid]["offered"]
     return term in o or o in ("", "All Terms", "Offer as needed") if term in ("Summer", "Winter") else term in o or "All" in o or o in ("", "Offer as needed")
+
+
+def sections_for(cid, term):
+    """Real sections for this course in that season, newest scraped term first ([] if none)."""
+    for t in SEASON.get(term, ()):
+        if secs := sections.get(t, {}).get(cid):
+            return secs
+    return []
+
+
+def offered(cid, term):
+    """Does this course actually run that term?
+
+    Real sections win, but ONLY to move a course between seasons. Absence from every scraped term falls back
+    to the catalog prose, and that fallback is load-bearing -- do not "tighten" it. 2,730 of 3,834 catalog
+    courses have no section in any scraped term, and they are not all dead: 14 of the 44 courses in the
+    CSCI-BS requirements (CSCI 310, 335, 365, 383, ...) and PHYS 204/227 on the official degree map are among
+    them, because electives rotate across years. Treating "no section" as "not offered" would delete a third
+    of the major's elective list. What we CAN say confidently is the narrower claim below.
+    """
+    if sections_for(cid, term):
+        return True
+    if any(cid in sections.get(t, {}) for t in sections):
+        return False            # it runs at QC in another season -- for THAT we trust the section data
+    return offered_text(cid, term)
+
+
+def fits(sec, avail):
+    """One section against the student's availability. Times are minutes past midnight, so an overlap is a
+    single comparison. A section with no meeting time (asynchronous online, TBA) always fits."""
+    for m in [sec] + (sec.get("extra") or []):
+        if m.get("start") is None:
+            continue
+        if m["start"] < avail.get("earliest", 0) or m["end"] > avail.get("latest", 24 * 60):
+            return False
+        for day, s, e in avail.get("busy") or ():
+            if day in m["days"] and m["start"] < e and s < m["end"]:
+                return False
+    return True
+
+
+def available(cid, term, avail):
+    """Sections of this course the student could actually attend. Returns None when we have no schedule
+    data for it at all -- 'unknown', which must not be confused with 'nothing fits'."""
+    secs = sections_for(cid, term)
+    if not secs:
+        return None
+    return [s for s in secs if fits(s, avail)] if avail else secs
 
 
 def map_rank(program, cid):
@@ -175,7 +230,7 @@ def map_rank(program, cid):
     return 99
 
 
-def candidates(program, taken, term):
+def candidates(program, taken, term, avail=None):
     taken = set(taken)
     major = major_progress(program, taken)
     slots = pathways(taken)
@@ -189,6 +244,9 @@ def candidates(program, taken, term):
     for cid, c in courses.items():
         if cid not in eligible or not offered(cid, term) or c["credits"] == 0:
             continue
+        secs = available(cid, term, avail)
+        if secs == []:                       # has real sections, none the student can attend -- drop it
+            continue                         # (None means "no schedule data", which is not a reason to drop)
         reason, score, key = None, None, cid
         for req in major:
             hit = next((o for o in req["missing"] if cid in o), None)
@@ -214,7 +272,8 @@ def candidates(program, taken, term):
         if (rank := map_rank(program, cid)) < 99:            # the official degree map's ordering wins
             score = (0, rank)
         out.append({"id": cid, "reason": reason, "score": score, "key": key,
-                    "verified": verified(cid), "source": source.get(cid, "policy" if cid in prereqs else None)})
+                    "verified": verified(cid), "source": source.get(cid, "policy" if cid in prereqs else None),
+                    "sections": secs[:6] if secs else None})   # null = no schedule data, shown as such
     # tie-break: prefer courses that are prerequisites of something on the official degree map (e.g. PHYS 103 over ASTR 2)
     map_prereqs = {p for sem in program["semesters"] for slot in sem["slots"] for cid in slot["courses"] for g in prereqs.get(cid, []) for p in g}
     out.sort(key=lambda x: (x["score"], x["id"] not in map_prereqs, courses[x["id"]]["code"]))
@@ -279,27 +338,39 @@ def pick(cands, taken, locked=(), order=()):
     return picked
 
 
-def gemini_order(program, term, cands, locked, progress):
+def when(c):
+    """'TuTh 1:40PM-2:30PM' for the first fitting section, or '' when we have no schedule for it."""
+    s = (c.get("sections") or [None])[0]
+    if not s or s.get("start") is None:
+        return ""
+    fmt = lambda m: f"{(m // 60 - 1) % 12 + 1}:{m % 60:02d}{'AM' if m < 720 else 'PM'}"
+    return f'{s["days"]} {fmt(s["start"])}-{fmt(s["end"])}'
+
+
+def gemini_order(program, term, cands, locked, progress, avail=None):
     """Gemini's ordered picks (candidate dicts with its one-line reason), or None (no key / failure)."""
     key = os.environ.get("GEMINI_API_KEY")
     if not key:
         return None
     major_ids = {i for req in program["requirements"] for r in req["rules"] for o in r["options"] for i in o}
-    lines = [f'{c["id"]} | {courses[c["id"]]["code"]} {courses[c["id"]]["name"]} | {courses[c["id"]]["credits"]} cr | {c["reason"]} | unlocks: '
+    lines = [f'{c["id"]} | {courses[c["id"]]["code"]} {courses[c["id"]]["name"]} | {courses[c["id"]]["credits"]} cr | {c["reason"]} | {when(c)} | unlocks: '
              + ", ".join(courses[u]["code"] for u in c["unlocks"] if u in major_ids)   # only major unlocks: a gen-ed chain (ACCT 261 -> 361W) is never a reason
              for c in cands[:40] if c not in locked]
     lcr = sum(courses[c["id"]]["credits"] for c in locked)
     fixed = ("The student has already placed these in the term (keep them, do not repeat them): "
              + ", ".join(f'{courses[c["id"]]["code"]} ({courses[c["id"]]["credits"]} cr)' for c in locked) + f" = {lcr} credits.\n") if locked else ""
+    # every listed course already fits the student's availability -- this only asks for a compact day/time spread
+    sched = ("Every course listed below already fits the student's stated availability. Among equally good choices prefer\n"
+             "a term whose meeting times cluster on fewer days and do not leave long midday gaps.\n") if avail else ""
     prompt = f"""You are an academic advisor at Queens College planning a {term} semester for a {program['name']} ({program['degree']}) student
 who has completed {progress['credits']} credits. {fixed}Pick courses from the ELIGIBLE list only so the whole term has at least {MIN_COURSES} courses
 and {TARGET_CREDITS}-{MAX_CREDITS} credits (so pick about {max(TARGET_CREDITS - lcr, 0)}-{MAX_CREDITS - lcr} more credits, {max(MIN_COURSES - len(locked), 0)} or more courses).
 Balance major courses with Pathways (general education) courses, prefer courses that unlock the most major courses, and
 avoid more than 2 courses of the same subject. Never take a course only to reach a later general-education or Writing
 Intensive course: fill each Pathways or Writing Intensive slot with the lowest-level course that fits it directly. List them most important first.
-Return ONLY JSON: {{"courses": [{{"id": "<id>", "reason": "<one short sentence for the student>"}}]}}
+{sched}Return ONLY JSON: {{"courses": [{{"id": "<id>", "reason": "<one short sentence for the student>"}}]}}
 
-ELIGIBLE (id | course | credits | why it is needed | what it unlocks):
+ELIGIBLE (id | course | credits | why it is needed | meeting time | what it unlocks):
 """ + "\n".join(lines)
     body = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"responseMimeType": "application/json", "temperature": 0.4}}
     req = urllib.request.Request(f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={key}",
@@ -332,21 +403,26 @@ def suggest(body):
     term = body.get("term", "Fall")
     terms = body.get("terms") or ([body["taken"]] if body.get("taken") else [])   # ordered approved terms (or a flat list)
     taken = {i for t in terms for i in t}
-    cands, progress = candidates(program, taken, term)
+    avail = body.get("avail") or None
+    cands, progress = candidates(program, taken, term, avail)
     valid = {c["id"]: c for c in cands}
     locked = [valid[i] for i in dict.fromkeys(body.get("pins", []) + body.get("queue", [])) if i in valid]
-    key = (body["program"], tuple(tuple(t) for t in terms), term, tuple(c["id"] for c in locked))
+    key = (body["program"], tuple(tuple(t) for t in terms), term, tuple(c["id"] for c in locked),
+           json.dumps(avail, sort_keys=True))
     if not body.get("fresh") and key in _cache:
         return _cache[key]
     lcr = sum(courses[c["id"]]["credits"] for c in locked)
-    order = None if lcr >= TARGET_CREDITS and len(locked) >= MIN_COURSES else gemini_order(program, term, cands, locked, progress)
+    order = None if lcr >= TARGET_CREDITS and len(locked) >= MIN_COURSES else gemini_order(program, term, cands, locked, progress, avail)
     picked = pick(cands, taken, locked, order or ())
     base = taken | {c["id"] for c in picked}
     for c in cands:                                    # recompute against the chosen term (candidates() used taken only)
         c["unlocks"] = unlocks(c["id"], base, program)
     strip = lambda c: {k: v for k, v in c.items() if k not in ("score", "key")}
     out = {"suggested": [strip(c) for c in picked], "candidates": [strip(c) for c in cands], "progress": progress,
-           "source": "gemini" if order else "heuristic", "violations": validate(terms)}
+           "source": "gemini" if order else "heuristic", "violations": validate(terms),
+           # only the next term maps to a schedule the registrar has actually published; terms after it reuse
+           # the same season's pattern, which is a fair guide but is not a booking. Say which, never imply both.
+           "schedule": {"basis": "published" if not terms else "pattern", "scraped": _meta.get("scraped")} if sections else None}
     _cache[key] = out
     return out
 
@@ -385,4 +461,6 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     print(f"{len(courses)} courses, {len(programs)} programs, {len(prereqs)} with prereqs, {len(gened)} gen-ed; "
           f"gemini: {'on' if os.environ.get('GEMINI_API_KEY') else 'off (heuristic)'}")
-    ThreadingHTTPServer(("", 8000), Handler).serve_forever()
+    port = int(os.environ.get("PORT", 8000))   # ponytail: PORT= to run a second copy beside a live one
+    print(f"listening on :{port}")
+    ThreadingHTTPServer(("", port), Handler).serve_forever()

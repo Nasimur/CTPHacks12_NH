@@ -7,8 +7,20 @@ export type Program = { id: string; name: string; degree: string; description: s
 export type Prereqs = Record<string, string[][]>;
 
 export type Term = { name: string; kind: 'Fall' | 'Spring' | 'Summer' | 'Winter'; courses: string[] };
-/** verified=false: a 200+ course with no prerequisite found in any source — confirm with an advisor */
-export type Suggestion = { id: string; reason: string; unlocks: string[]; verified: boolean; source: string | null };
+/** A real CUNYfirst class section. `start`/`end` are minutes past midnight; null for async/TBA. */
+export type Section = {
+  sec: string; component: string; days: string; start: number | null; end: number | null;
+  extra: { days: string; start: number; end: number }[];
+  room: string; instr: string; mode: string; status: string; raw: string;
+};
+/** The student's weekly availability. Days are the 2-char CUNYfirst tokens: Mo Tu We Th Fr Sa Su. */
+export type Availability = { busy: [string, number, number][]; earliest: number; latest: number };
+/** verified=false: a 200+ course with no prerequisite found in any source — confirm with an advisor
+ *  sections=null: we have no schedule data for this course, which is NOT the same as "nothing fits" */
+export type Suggestion = {
+  id: string; reason: string; unlocks: string[]; verified: boolean; source: string | null;
+  sections: Section[] | null;
+};
 export type Violation = { id: string; term: number; missing: string[] };
 export type Progress = {
   credits: number;
@@ -17,4 +29,7 @@ export type Progress = {
 };
 export type SuggestResponse = {
   suggested: Suggestion[]; candidates: Suggestion[]; progress: Progress; source: 'gemini' | 'heuristic'; violations: Violation[];
+  /** basis='published': the registrar has released this term's schedule. 'pattern': same season, a year on —
+   *  a fair guide to when a course usually meets, but not a booking. null: no section data scraped. */
+  schedule: { basis: 'published' | 'pattern'; scraped: string } | null;
 };

@@ -13,6 +13,7 @@ the eligible set, and its picks go through the same guards as the rule-based pic
 partner, one course per Pathways slot). Responses are cached per input; "fresh" bypasses the cache (Regenerate).
 """
 import csv, json, os, re, urllib.request
+from collections import Counter
 from io import BytesIO
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -47,6 +48,10 @@ COURSE_CODE = re.compile(r"\b[A-Z]{2,5}\s+\d{1,4}[A-Z]?\b")
 GREEN = (0.0, 0.502, 0.302)
 
 
+TRANSFER_ROW = re.compile(r"Satisfied by:\s*-\s*(.+?)\s*$")
+NOT_APPLIED = re.compile(r"\s*(Elective Courses Not Allowed|Fall-?through|Insufficient Grades|In-progress|Not Counted)\b")
+
+
 def norm(s):
     return re.sub(r"[^a-z0-9]+", "", s.lower())
 
@@ -68,25 +73,43 @@ def program_from_audit(text):
 
 def parse_degreeworks_text(text):
     program_id, major_label, degree_label = program_from_audit(text)
-    seen, parsed, grouped = set(), [], {}
+    seen, parsed, grouped, last = set(), [], {}, None
     for line in text.splitlines():
+        if NOT_APPLIED.match(line):     # everything after these headers is listed but applies to no requirement
+            break
+        transfer = TRANSFER_ROW.search(line)
+        if transfer and parsed:
+            school = transfer.group(1).strip()
+            parsed[-1]["transfer"] = school
+            grouped[parsed[-1]["key"]].setdefault("transfers", {})[parsed[-1]["id"]] = school
+            continue
         for m in COURSE_ROW.finditer(line):
             code = f"{m.group(1)} {m.group(2)}"
             cid = by_code.get(code)
-            if not cid:
-                continue
             grade = m.group(4)
             credits = float(m.group(5) or m.group(6) or 0)
-            if grade in NON_COMPLETION_GRADES or credits <= 0:
+            # No grade floor here: DegreeWorks already applies each department's floor by moving a low grade into the
+            # "Not Allowed" block (cut off above) or zeroing its credits. IP rows DO apply — DegreeWorks counts them.
+            if (grade in NON_COMPLETION_GRADES and grade != "IP") or credits <= 0:
                 continue
             term = m.group(7).title()
             year = int(m.group(8))
             key = (year, TERM_ORDER[term])
-            grouped.setdefault(key, {"name": f"{term} {year}", "kind": term, "courses": []})
-            if (cid, key) not in seen:
-                grouped[key]["courses"].append(cid)
-                seen.add((cid, key))
-            parsed.append({"id": cid, "code": code, "grade": grade, "credits": credits, "term": term, "year": year})
+            grouped.setdefault(key, {"name": f"{term} {year}", "kind": term, "courses": [], "extra": 0})
+            # DegreeWorks lists the same course in several requirement blocks; count it once per line-item, not once per block.
+            # ponytail: repeated placeholder rows (ARTS 499 x6) are consecutive, cross-block repeats never are — consecutive = distinct
+            row = (code, grade, credits, key)
+            if row in seen and last != (code, key):
+                continue
+            seen.add(row)
+            last = (code, key)
+            if not cid:                                            # not in our catalog (e.g. a transfer-only code) — credits still count
+                grouped[key]["extra"] += credits
+                continue
+            grouped[key]["courses"].append(cid)
+            parsed.append({"id": cid, "code": code, "grade": grade, "credits": credits, "term": term, "year": year, "transfer": None, "key": key})
+    for p in parsed:
+        del p["key"]
     return {
         "program": program_id,
         "major": major_label or None,
@@ -414,6 +437,9 @@ def math_audit_completions(audit_requirements):
 
 
 def major_progress(program, taken, audit_requirements=None):
+    """`taken` may be a set or a {courseId: times_taken} Counter; repeatable courses (CSCI 381 x3) count every time
+    toward credit-kind rules, once toward count-kind rules."""
+    times = taken if isinstance(taken, dict) else {i: 1 for i in taken}
     audit_requirements = audit_reqs(audit_requirements or [])
     out = []
     for req in program["requirements"]:
@@ -423,7 +449,7 @@ def major_progress(program, taken, audit_requirements=None):
         for rule in req["rules"]:
             sat = [o for o in rule["options"] if any(i in taken for i in o)]
             need += rule["n"]
-            have += sum(courses[next(i for i in o if i in taken)]["credits"] for o in sat) if rule["kind"] == "credits" else min(len(sat), rule["n"])
+            have += sum(courses[i]["credits"] * times[i] for o in sat for i in o if i in taken) if rule["kind"] == "credits" else min(len(sat), rule["n"])
             completed += [[i for i in o if i in taken] for o in sat]
             if have < need:
                 missing += [o for o in rule["options"] if o not in sat]
@@ -570,10 +596,11 @@ def preference_subjects(preferences):
 
 
 def candidates(program, taken, term, avail=None, preferences=None, audit_requirements=None):
+    times = Counter(taken)            # multiplicity matters for credit-kind rules only
     taken = set(taken)
     preferred, avoided = preference_subjects(preferences)
     audit_requirements = audit_reqs(audit_requirements or [])
-    major = major_progress(program, taken, audit_requirements)
+    major = major_progress(program, times, audit_requirements)
     slots = pathways(taken)
     open_slots = [(s["slot"], s["label"], fit) for s, (_, _, fit) in zip(slots, SLOTS) if not s["course"]]
     need_w = sum(1 for s in slots if s["slot"].startswith("W") and not s["course"])
@@ -769,12 +796,13 @@ def suggest(body):
     program = programs[body["program"]]
     term = body.get("term", "Fall")
     terms = body.get("terms") or ([body["taken"]] if body.get("taken") else [])   # ordered approved terms (or a flat list)
-    taken = {i for t in terms for i in t}
+    times = Counter(i for t in terms for i in t)   # multiplicity: repeated courses count toward credit rules
+    taken = set(times)
     avail = body.get("avail") or None
     preferences = body.get("preferences") or None
     preferred, avoided = preference_subjects(preferences)
     audit_requirements = audit_reqs(body)
-    cands, progress = candidates(program, taken, term, avail, preferences, audit_requirements)
+    cands, progress = candidates(program, times, term, avail, preferences, audit_requirements)
     valid = {c["id"]: c for c in cands}
     locked = [valid[i] for i in dict.fromkeys(body.get("pins", []) + body.get("queue", [])) if i in valid]
     key = (body["program"], tuple(tuple(t) for t in terms), term, tuple(c["id"] for c in locked),

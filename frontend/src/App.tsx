@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, MotionConfig, motion } from 'motion/react';
 import type { AuditImport, AuditRequirement, Availability, Course, Prereqs, Program, Section, SuggestResponse, Suggestion, Term } from './types';
-import { DEGREE_CREDITS, GEOM, bandH, nextTerm, pos } from './plan';
+import { COLS, DEGREE_CREDITS, GEOM, bandH, nextTerm, pos } from './plan';
 import './App.css';
 
 const load = <T,>(f: string, fallback: T): Promise<T> => fetch(`/data/${f}`).then(r => (r.ok ? r.json() : fallback)).catch(() => fallback);
@@ -157,8 +157,11 @@ export default function App() {
   const program = programs.find(p => p.id === pid);
   const taken = useMemo(() => terms.flatMap(t => t.courses), [terms]);
   const current = useMemo(() => nextTerm(terms, breaks), [terms, breaks]);
-  const done = resp ? resp.progress.credits >= DEGREE_CREDITS : false;
   const credits = (ids: string[]) => ids.reduce((s, id) => s + (courses.get(id)?.credits ?? 0), 0);
+  // done = what DegreeWorks calls complete: credit total AND every major rule AND every Pathways slot
+  const extra = terms.reduce((s, t) => s + (t.extra ?? 0), 0);
+  const done = !!resp && credits(taken) + extra >= DEGREE_CREDITS
+    && resp.progress.major.every(m => m.have >= m.need) && resp.progress.pathways.every(s => s.course);
   /** Has the student actually narrowed anything? If not we send no `avail` at all, so the filter is inert. */
   const availNarrowed = avail.busy.length > 0 || avail.earliest > 0 || avail.latest < 24 * 60;
   /** True once we are past the term the registrar has published: times are then a season pattern, not a booking. */
@@ -221,7 +224,6 @@ export default function App() {
     if (c) { if (!proposal.some(p => p.id === id)) setProposal([...proposal, c]); if (!pins.includes(id)) setPins([...pins, id]); setQueue(queue.filter(q => q !== id)); }
     else if (!queue.includes(id)) setQueue([...queue, id]);
   };
-  const defer = (id: string) => { remove(id); if (!queue.includes(id)) setQueue([...queue, id]); };
   const unqueue = (id: string) => setQueue(queue.filter(q => q !== id));
   /** Ghosts are unlocked by `src` in the proposed term: pin `src` (so Regenerate keeps the prerequisite) and queue the ghost for the next eligible term. */
   const enqueue = (id: string, src: string) => {
@@ -282,8 +284,8 @@ export default function App() {
   };
 
   // --- DAG geometry: one band per approved term (top to bottom), then the proposal band, then the queue band ---
-  const levels: { name: string; kind: string; ids: string[]; proposed?: boolean; queued?: boolean }[] = [
-    ...terms.map(t => ({ name: t.name, kind: t.kind, ids: [...new Set(t.courses)] })),   // older saved plans may hold a duplicate
+  const levels: { name: string; kind: string; ids: string[]; proposed?: boolean; queued?: boolean; transfers?: Record<string, string>; cr?: number }[] = [
+    ...terms.map(t => ({ name: t.name, kind: t.kind, ids: [...new Set(t.courses)], transfers: t.transfers, cr: credits(t.courses) + (t.extra ?? 0) })),   // one card per course; credits count every row
     ...(done ? [] : [{ name: current.name, kind: current.kind, ids: proposal.map(p => p.id), proposed: true }]),
     ...(queue.length ? [{ name: 'Queued', kind: 'queue', ids: queue, queued: true }] : []),
   ];
@@ -348,10 +350,12 @@ export default function App() {
   levels.forEach((l, level) => l.ids.forEach((id, i) => place.set(id, { level, i })));
   const edges: { from: string; to: string }[] = [];
   for (const [id, p] of place) for (const g of prereqs[id] ?? []) for (const q of g) if (place.has(q) && place.get(q)!.level < p.level) edges.push({ from: q, to: id });
-  const widest = Math.max(1, ...levels.map(l => l.ids.length));
+  const widest = Math.min(COLS, Math.max(1, ...levels.map(l => l.ids.length)));
   const W = GEOM.PAD * 2 + widest * (GEOM.CARD_W + GEOM.COL_GAP) + GEOM.LABEL_W;
-  const H = GEOM.PAD * 2 + Math.max(1, levels.length) * (bandH + GEOM.ROW_GAP) - GEOM.ROW_GAP;
-  const at = (id: string) => { const p = place.get(id)!; return pos(p.level, p.i, levels[p.level].ids.length, W); };
+  const tops: number[] = [];
+  levels.reduce((y, l) => { tops.push(y); return y + bandH(l.ids.length) + GEOM.ROW_GAP; }, GEOM.PAD);
+  const H = levels.length ? tops[levels.length - 1] + bandH(levels[levels.length - 1].ids.length) + GEOM.PAD : GEOM.PAD * 2 + bandH(0);
+  const at = (id: string) => { const p = place.get(id)!; return pos(tops[p.level], p.i, levels[p.level].ids.length, W); };
   const proposalCredits = credits(proposal.map(p => p.id));
   const courseCodes = (ids: string[]) => ids.map(id => courses.get(id)?.code ?? id).join(' or ');
   const auditReqText = (a: AuditRequirement) => courseCodes(a.courses);
@@ -369,7 +373,7 @@ export default function App() {
     else if (rawWarn === error) setError('');
     else setDismissedWarn(rawWarn);
   };
-  const totalCredits = resp?.progress.credits ?? credits(taken);
+  const totalCredits = credits(taken) + extra;   // counted here, not server-side: the server dedupes `taken`, the audit does not
 
   // --- ghosts: up to 3 not-yet-planned courses the hovered one unlocks, fanned below it in a half-wheel ---
   const unlockedBy = useMemo(() => {
@@ -461,7 +465,6 @@ export default function App() {
                                 : <p className="text-[12px] text-ink-3">no published schedule</p>}
                               {p.unlocks.length > 0 && <p className="text-[12px] text-ink-3">→ unlocks {p.unlocks.slice(0, 5).map(u => courses.get(u)?.code).join(', ')}</p>}
                             </button>
-                            <button className={`${icon} h-6 w-6 opacity-0 group-hover:opacity-100 focus-visible:opacity-100`} onClick={() => defer(p.id)} aria-label={`Defer ${c?.code} to a later term`} title="Defer to a later term">›</button>
                             <button className={`${icon} h-6 w-6 opacity-0 group-hover:opacity-100 focus-visible:opacity-100`} onClick={() => remove(p.id)} aria-label={`Remove ${c?.code}`} title="Remove">×</button>
                           </motion.li>;
                         })}
@@ -626,13 +629,13 @@ export default function App() {
                     }`}
                   style={{
                     left: GEOM.PAD,
-                    top: pos(i, 0, 1, W).y - GEOM.BAND_PAD,
+                    top: tops[i],
                     width: W - GEOM.PAD * 2,
-                    height: bandH,
+                    height: bandH(l.ids.length),
                   }}>
                   <div className="absolute left-4 top-1/2 -translate-y-1/2 leading-tight">
                     <b className={`block text-[13px] font-semibold ${l.queued ? 'text-ink-2' : ''}`}>{l.name}</b>
-                    <small className="text-[12px] text-ink-2 tabular-nums">{l.queued ? 'when eligible' : `${credits(l.ids)} cr${l.proposed ? ' · proposed' : ''}`}</small>
+                    <small className="text-[12px] text-ink-2 tabular-nums">{l.queued ? 'when eligible' : `${l.cr ?? credits(l.ids)} cr${l.proposed ? ' · proposed' : ''}`}</small>
                   </div>
                 </motion.div>
               ))}
@@ -708,7 +711,7 @@ export default function App() {
                       s?.unlocks.length ? `Unlocks: ${s.unlocks.map(u => courses.get(u)?.code).join(', ')}` : '',
                       (prereqs[id] ?? []).length ? `Prereqs: ${prereqs[id].map(g => g.map(q => courses.get(q)?.code).join(' or ')).join(' and ')}${s?.source ? ` (source: ${s.source})` : ''}`
                         : unverified.has(id) ? 'Prereqs: none found in the catalog — confirm with an advisor' : '',
-                      c.description,
+                      col.transfers?.[id] ? `Transfer Credit from ${col.transfers[id]}` : c.description,
                     ].filter(Boolean).join('\n\n') : id}
                     onMouseEnter={() => enter(id)} onMouseLeave={leave}>
                     <div className={`h-1.5 w-1.5 shrink-0 rounded-full ${tone === 'danger' ? 'bg-danger' : tone === 'warning' ? 'bg-warning' : pinned ? 'bg-accent' : col.proposed || col.queued ? 'bg-line-strong' : 'bg-success'}`} />

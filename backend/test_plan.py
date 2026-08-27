@@ -34,9 +34,9 @@ Software Engineering CSCI 370 Software Engineering W 0 SPRING 2026
 CSCI 320 Theory of Computation F 0 FALL 2025
 """)
 assert audit["program"] == "CSCI-BA", audit
-assert [t["name"] for t in audit["terms"]] == ["Fall 2023", "Spring 2024"], audit["terms"]
-assert audit["terms"][0]["courses"] == cs("CSCI 111") and audit["terms"][1]["courses"] == cs("CSCI 211"), audit["terms"]
-assert {c["code"] for c in audit["courses"]} == {"CSCI 111", "CSCI 211"}, audit["courses"]
+assert [t["name"] for t in audit["terms"]] == ["Fall 2023", "Spring 2024", "Fall 2026"], audit["terms"]   # IP applies (DegreeWorks counts it); W/F do not
+assert audit["terms"][0]["courses"] == cs("CSCI 111") and audit["terms"][1]["courses"] == cs("CSCI 211") and audit["terms"][2]["courses"] == cs("CSCI 331"), audit["terms"]
+assert {c["code"] for c in audit["courses"]} == {"CSCI 111", "CSCI 211", "CSCI 331"}, audit["courses"]
 
 calc_audit = [{"title": "CALCULUS REQUIREMENT", "parent": "MATH REQUIREMENT", "courses": cs("MATH 141", "MATH 142", "MATH 143"), "page": 1}]
 calc_terms = [cs("MATH 120", "MATH 141", "MATH 142", "MATH 143", "MATH 231", "MATH 241")]

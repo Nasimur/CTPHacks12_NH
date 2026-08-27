@@ -598,14 +598,14 @@ export default function App() {
                     ${tone === 'danger' ? 'border-danger bg-danger-soft' : tone === 'warning' ? 'border-warning bg-warning-soft' : hot?.has(id) ? 'border-accent' : pinned ? 'border-accent bg-accent-soft/40' : col.proposed || col.queued ? 'border-dashed border-line-strong hover:border-ink-3' : 'border-line hover:border-line-strong'}`}
                     style={{ width: GEOM.CARD_W, height: GEOM.CARD_H }}
                     title={c ? [
-                      `${c.name}\n${c.credits} cr · ${c.offered}`,
+                      `${c.name}\n${c.credits} cr`,
                       col.proposed ? (pinned ? 'Pinned for this term — click to unpin' : 'Click to pin for this term') : col.queued ? 'Queued — joins the first eligible term' : '',
                       v ? `Needs ${v.missing.map(m => courses.get(m)?.code).join(' or ')} in an earlier term` : '',
                       st === 'missing' ? 'Prerequisites not met by an earlier term — remove or defer before approving' : st === 'partial' ? 'Almost eligible: some prerequisites are still missing from earlier terms' : '',
                       s ? `Why: ${s.reason}` : '',
                       s?.unlocks.length ? `Unlocks: ${s.unlocks.map(u => courses.get(u)?.code).join(', ')}` : '',
                       (prereqs[id] ?? []).length ? `Prereqs: ${prereqs[id].map(g => g.map(q => courses.get(q)?.code).join(' or ')).join(' and ')}${s?.source ? ` (source: ${s.source})` : ''}`
-                        : unverified.has(id) ? 'Prereqs: none found in catalog or bulletin — confirm with an advisor' : '',
+                        : unverified.has(id) ? 'Prereqs: none found in the catalog — confirm with an advisor' : '',
                       c.description,
                     ].filter(Boolean).join('\n\n') : id}
                     onMouseEnter={() => enter(id)} onMouseLeave={leave}>

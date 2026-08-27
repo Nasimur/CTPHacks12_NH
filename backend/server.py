@@ -130,7 +130,10 @@ def major_progress(program, taken):
 
 
 def level(cid):
-    n = int(re.match(r"[0-9]+", courses[cid]["code"].split()[1]).group())
+    m = re.match(r"[0-9]+", courses[cid]["code"].split()[1])
+    if not m:                                                 # 29 catalog codes have no leading digit (CAS E11, ACCT E305)
+        return 0                                              # treat as intro: never flagged unverified, never a W tiebreak
+    n = int(m.group())
     return n // 10 if n >= 1000 else n                        # CUNY 4-digit codes: CHEM 1013 is 100-level
 
 

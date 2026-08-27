@@ -26,15 +26,30 @@ TARGET_CREDITS, MAX_CREDITS, MIN_COURSES = 15, 20, 5   # aim for ~15 cr and >=5 
 courses = {c["id"]: c for c in json.loads((DATA / "courses.json").read_text(encoding="utf8"))}
 programs = {p["id"]: p for p in json.loads((DATA / "programs.json").read_text(encoding="utf8"))}
 prereqs = json.loads((DATA / "prereqs.json").read_text(encoding="utf8")) if (DATA / "prereqs.json").exists() else {}
+by_code = {c["code"]: c["id"] for c in courses.values()}
+# CS department's approved non-CS electives (cs.qc.cuny.edu/approved_nonCSelective.html): at most ONE may count toward
+# the CSCI elective credits, and not if it already satisfies the math requirement (the fixed-course filter below handles that).
+# Coursedog's "Computer Science Electives" set omits them, so they're spliced in here rather than in the scraped data.
+NONCS_ELECTIVES = ("BIOL 330 MATH 202 MATH 223 MATH 224 MATH 231 MATH 232 MATH 242 MATH 245 MATH 247 MATH 248 MATH 301 MATH 317 "
+                   "MATH 337 MATH 341 MATH 342 MATH 609 MATH 613 MATH 619 MATH 621 MATH 623 MATH 624 MATH 625 MATH 626 MATH 633 "
+                   "MATH 634 MATH 635 MATH 636 PHYS 225 PHYS 227 PHYS 265 PHYS 311")
+_noncs = [by_code[c] for c in re.findall(r"[A-Z]+ \d+", NONCS_ELECTIVES) if c in by_code]
+for _pid in ("CSCI-BS", "CSCI-BA"):
+    for _r in programs.get(_pid, {"requirements": []})["requirements"]:
+        for _ru in _r["rules"]:
+            if _ru.get("set") and _ru["kind"] == "credits":
+                _ru["options"] += [[i] for i in _noncs if [i] not in _ru["options"]]
+                _ru["cap"] = {"ids": _noncs, "n": 1}
 for _p in programs.values():                                   # a course required elsewhere in the major can't also be an elective
     _fixed = {i for r in _p["requirements"] for ru in r["rules"] if not ru.get("set") for o in ru["options"] for i in o}
     for r in _p["requirements"]:
         for ru in r["rules"]:
             if ru.get("set"):
                 ru["options"] = [o for o in ru["options"] if not set(o) & _fixed]
+                if ru.get("cap"):                                  # a required MATH course can't consume the one non-CS slot
+                    ru["cap"]["ids"] = [i for i in ru["cap"]["ids"] if i not in _fixed]
 coreqs = set(json.loads((DATA / "coreqs.json").read_text())) if (DATA / "coreqs.json").exists() else set()
 source = json.loads((DATA / "prereq_source.json").read_text()) if (DATA / "prereq_source.json").exists() else {}   # provenance
-by_code = {c["code"]: c["id"] for c in courses.values()}
 
 TERM_ORDER = {"Winter": 0, "Spring": 1, "Summer": 2, "Fall": 3}
 NON_COMPLETION_GRADES = {"F", "FIN", "W", "WA", "WD", "WN", "WU", "INC", "IP", "NC", "AUD"}
@@ -447,12 +462,19 @@ def major_progress(program, taken, audit_requirements=None):
         completed, missing = [], []   # completed/todo options (OR-groups)
         audit_completed = []
         for rule in req["rules"]:
-            sat = [o for o in rule["options"] if any(i in taken for i in o)]
+            # cap: {"ids", "n"} — at most n of these ids count; once met, the rest neither count nor show as missing
+            cap, blocked = rule.get("cap"), set()
+            if cap:
+                got = [i for i in cap["ids"] if i in taken]
+                if len(got) >= cap["n"]:
+                    blocked = set(cap["ids"]) - set(got[:cap["n"]])
+            ok = lambda i: i in taken and i not in blocked
+            sat = [o for o in rule["options"] if any(ok(i) for i in o)]
             need += rule["n"]
-            have += sum(courses[i]["credits"] * times[i] for o in sat for i in o if i in taken) if rule["kind"] == "credits" else min(len(sat), rule["n"])
-            completed += [[i for i in o if i in taken] for o in sat]
+            have += sum(courses[i]["credits"] * times[i] for o in sat for i in o if ok(i)) if rule["kind"] == "credits" else min(len(sat), rule["n"])
+            completed += [[i for i in o if ok(i)] for o in sat]
             if have < need:
-                missing += [o for o in rule["options"] if o not in sat]
+                missing += [o for o in rule["options"] if o not in sat and not set(o) <= blocked]
         if is_math_req(req):
             audit_math_done = math_audit_completions(audit_requirements)
             calc_done = [r for r in audit_math_done if norm(r["title"]) == "calculusrequirement"]

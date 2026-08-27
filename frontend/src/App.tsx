@@ -41,6 +41,9 @@ type DraggedCourse = {
   from: CourseLocation;
 };
 
+type SubjectPreferences = { preferredSubjects: string[]; avoidedSubjects: string[] };
+const NO_PREFERENCES: SubjectPreferences = { preferredSubjects: [], avoidedSubjects: [] };
+
 const PanelIcon = ({ side }: { side: 'left' | 'right' }) => (
   <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
     <rect x="1.75" y="2.75" width="12.5" height="10.5" rx="2" />
@@ -60,6 +63,7 @@ export default function App() {
   const [pid, setPid] = useState<string>(() => store('program') ?? 'CSCI-BS');
   const [breaks, setBreaks] = useState(false);
   const [avail, setAvail] = useState<Availability>(() => store<Availability>('avail') ?? NO_AVAIL);
+  const [preferences, setPreferences] = useState<SubjectPreferences>(() => store<SubjectPreferences>('preferences') ?? NO_PREFERENCES);
   const [terms, setTerms] = useState<Term[]>(() => store<Term[]>(`terms:${store('program') ?? 'CSCI-BS'}`) ?? []);
   const [proposal, setProposal] = useState<Suggestion[]>([]);
   // pins: courses locked into the current proposal (survive Regenerate). queue: wanted later — promoted to a pin the first term they're eligible.
@@ -174,8 +178,9 @@ export default function App() {
     if (!program || done) return;
     const ctl = new AbortController();
     const { pins, queue } = latest.current;
+    const hasPreferences = preferences.preferredSubjects.length > 0 || preferences.avoidedSubjects.length > 0;
     const body = { program: pid, terms: terms.map(t => t.courses), term: current.kind, pins, queue,
-                   fresh: fresh.current, avail: availNarrowed ? avail : null };
+                   fresh: fresh.current, avail: availNarrowed ? avail : null, preferences: hasPreferences ? preferences : undefined };
     fresh.current = false;
     setLoading(true); setError('');
     fetch('/api/suggest', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: ctl.signal })
@@ -183,8 +188,9 @@ export default function App() {
       .then(r => { setResp(r); setProposal(merge(r)); setLoading(false); })
       .catch(e => { if (e.name !== 'AbortError') { setError(`Backend not reachable (${e.message}). Run: python backend/server.py`); setLoading(false); } });
     return () => ctl.abort();
-  }, [pid, taken, current.kind, !!program, avail]);   // eslint-disable-line react-hooks/exhaustive-deps
+  }, [pid, taken, current.kind, !!program, avail, preferences]);   // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { store('avail', avail); }, [avail]);
+  useEffect(() => { store('preferences', preferences); }, [preferences]);
 
   const approve = () => { if (blocked.length) return; const t = [...terms, { ...current, courses: proposal.map(p => p.id) }]; setTerms(t); store(`terms:${pid}`, t); setPins([]); };
   const reset = () => { setTerms([]); store(`terms:${pid}`, []); setResp(null); setPins([]); setQueue([]); };
@@ -209,6 +215,14 @@ export default function App() {
   };
   const label = (c: Course) => `${c.code} — ${c.name}`;
   const subjects = useMemo(() => [...new Set([...courses.values()].map(c => c.subject))].sort(), [courses]);
+  const preferenceCount = preferences.preferredSubjects.length + preferences.avoidedSubjects.length;
+  const addPreference = (kind: keyof SubjectPreferences, subject: string) => {
+    if (!subject) return;
+    const other: keyof SubjectPreferences = kind === 'preferredSubjects' ? 'avoidedSubjects' : 'preferredSubjects';
+    setPreferences(p => ({ ...p, [kind]: [...new Set([...p[kind], subject])], [other]: p[other].filter(s => s !== subject) }));
+  };
+  const removePreference = (kind: keyof SubjectPreferences, subject: string) =>
+    setPreferences(p => ({ ...p, [kind]: p[kind].filter(s => s !== subject) }));
   const addable = [...courses.values()].filter(c => (!filter.subject || c.subject === filter.subject)
     && (!filter.pathway || gened.courses[c.id]?.includes(filter.pathway)) && (!filter.eligible || eligibleNow(c.id)));
   /** Any catalog course can be added; eligibility is shown on the card (red/yellow) and gates Approve. Duplicates warn instead. */
@@ -425,6 +439,33 @@ export default function App() {
                         </div>
                         <p className="mt-1.5 text-[12px] text-ink-3">Struck-through days are days you can’t attend. Courses with no section that fits are not suggested.</p>
                         {availNarrowed && <button className={`${btn} mt-1 px-0 text-ink-2`} onClick={() => setAvail(NO_AVAIL)}>Clear availability</button>}
+                      </div>
+                    </details>
+                    <details className="mb-1.5">
+                      <summary className={`${btn} w-full cursor-pointer justify-between font-normal text-ink-2`}>
+                        Elective preferences{preferenceCount > 0 && <span className={tag}>{preferenceCount}</span>}
+                      </summary>
+                      <div className="mt-1.5 rounded-md border border-line p-2">
+                        <p className="mb-2 text-[12px] text-ink-3">Soft preferences for Pathways, Writing Intensive, and free electives only. Major requirements are unaffected.</p>
+                        {([
+                          ['preferredSubjects', 'Prefer', 'Preferred subject'],
+                          ['avoidedSubjects', 'Avoid if possible', 'Subject to avoid'],
+                        ] as const).map(([kind, label, aria]) => (
+                          <div key={kind} className="mb-2 last:mb-0">
+                            <label className="mb-1 block text-[12px] font-medium text-ink-2">{label}</label>
+                            <select className={`${field} w-full`} aria-label={aria} value="" onChange={e => addPreference(kind, e.target.value)}>
+                              <option value="">Choose a subject…</option>
+                              {subjects.filter(s => !preferences[kind].includes(s)).map(s => <option key={s} value={s}>{s}</option>)}
+                            </select>
+                            {preferences[kind].length > 0 && <div className="mt-1.5 flex flex-wrap gap-1">
+                              {preferences[kind].map(subject => <button key={subject} type="button" className={`${tag} inline-flex items-center gap-1 py-0.5 transition hover:bg-line`}
+                                onClick={() => removePreference(kind, subject)} aria-label={`Remove ${subject} ${label.toLowerCase()} preference`} title="Remove">
+                                {subject}<span aria-hidden="true">×</span>
+                              </button>)}
+                            </div>}
+                          </div>
+                        ))}
+                        {preferenceCount > 0 && <button className={`${btn} mt-1 px-0 text-ink-2`} onClick={() => setPreferences(NO_PREFERENCES)}>Clear preferences</button>}
                       </div>
                     </details>
                     <input list="cands" placeholder={`+ Add a course (${addable.length})`} value={adding} className={`${field} mb-3 w-full`} aria-label="Add course" onChange={e => { setAdding(e.target.value); add(e.target.value); }} />

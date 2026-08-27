@@ -3,7 +3,8 @@
     python backend/server.py            # http://localhost:8000
 
 POST /api/suggest  {"program": "CSCI-BS", "terms": [[courseId...]...], "term": "Fall"|"Spring"|"Summer"|"Winter",
-                    "pins": [courseId...], "queue": [courseId...], "fresh": bool}
+                    "pins": [courseId...], "queue": [courseId...], "preferences": {"preferredSubjects": [],
+                    "avoidedSubjects": []}, "fresh": bool}
   -> {"suggested": [{"id","reason","unlocks":[ids]}], "candidates": [...same...], "progress": {...}, "source": "gemini"|"heuristic"}
 
 The eligible set is computed here (prereqs met, not taken, offered that term, still needed by the major or
@@ -233,8 +234,18 @@ def map_rank(program, cid):
     return 99
 
 
-def candidates(program, taken, term, avail=None):
+def preference_subjects(preferences):
+    """Canonical preferred/avoided subject sets; malformed or omitted preferences are inert."""
+    preferences = preferences if isinstance(preferences, dict) else {}
+    clean = lambda name: {str(x).strip().upper() for x in preferences.get(name, []) if str(x).strip()} \
+        if isinstance(preferences.get(name, []), list) else set()
+    preferred = clean("preferredSubjects")
+    return preferred, clean("avoidedSubjects") - preferred
+
+
+def candidates(program, taken, term, avail=None, preferences=None):
     taken = set(taken)
+    preferred, avoided = preference_subjects(preferences)
     major = major_progress(program, taken)
     slots = pathways(taken)
     open_slots = [(s["slot"], s["label"], fit) for s, (_, _, fit) in zip(slots, SLOTS) if not s["course"]]
@@ -272,8 +283,16 @@ def candidates(program, taken, term, avail=None):
                 reason, score = "Free elective (Pathways-listed)", (5, c["code"])
         if not reason:
             continue
-        if (rank := map_rank(program, cid)) < 99:            # the official degree map's ordering wins
+        if (rank := map_rank(program, cid)) < 99 and reason.startswith("Major"):
+            # Only major entries on the official map are mandatory priorities. Sample Gen Ed entries remain choices.
             score = (0, rank)
+        flexible = reason.startswith(("Pathways", "Writing Intensive", "Free elective"))
+        if flexible:
+            pref_rank = 0 if c["subject"] in preferred else 2 if c["subject"] in avoided else 1
+            # Keep the existing requirement/level ordering, then use preferences as a soft tie-breaker.
+            score = (score[0], pref_rank, *score[1:]) if reason.startswith("Free elective") else (*score, pref_rank)
+            if c["subject"] in preferred:
+                reason += f"; matches your {c['subject']} preference"
         out.append({"id": cid, "reason": reason, "score": score, "key": key,
                     "verified": verified(cid), "source": source.get(cid, "policy" if cid in prereqs else None),
                     "sections": secs[:6] if secs else None})   # null = no schedule data, shown as such
@@ -282,7 +301,9 @@ def candidates(program, taken, term, avail=None):
     out.sort(key=lambda x: (x["score"], x["id"] not in map_prereqs, courses[x["id"]]["code"]))
     buckets, kept = {}, []                                    # keep variety: <=8 per Pathways slot, <=25 per other kind
     for x in out:
-        b = ("P", x["key"]) if x["score"][0] == 1 else x["score"][0]
+        flexible = x["reason"].startswith(("Pathways", "Writing Intensive", "Free elective"))
+        pref_rank = x["score"][-1] if flexible and not x["reason"].startswith("Free elective") else x["score"][1] if flexible else None
+        b = (("P", x["key"], pref_rank) if x["score"][0] == 1 else (x["score"][0], pref_rank) if flexible else x["score"][0])
         if buckets.get(b, 0) < (8 if x["score"][0] == 1 else 25):
             kept.append(x); buckets[b] = buckets.get(b, 0) + 1
     out = kept
@@ -350,7 +371,7 @@ def when(c):
     return f'{s["days"]} {fmt(s["start"])}-{fmt(s["end"])}'
 
 
-def gemini_order(program, term, cands, locked, progress, avail=None):
+def gemini_order(program, term, cands, locked, progress, avail=None, preferences=None):
     """Gemini's ordered picks (candidate dicts with its one-line reason), or None (no key / failure)."""
     key = os.environ.get("GEMINI_API_KEY")
     if not key:
@@ -365,13 +386,19 @@ def gemini_order(program, term, cands, locked, progress, avail=None):
     # every listed course already fits the student's availability -- this only asks for a compact day/time spread
     sched = ("Every course listed below already fits the student's stated availability. Among equally good choices prefer\n"
              "a term whose meeting times cluster on fewer days and do not leave long midday gaps.\n") if avail else ""
+    preferred, avoided = preference_subjects(preferences)
+    preference_rule = (f"For flexible choices only (Pathways, Writing Intensive, and free electives), prefer subjects "
+                       f"{', '.join(sorted(preferred)) or '(none)'}, then neutral subjects, and put avoided subjects "
+                       f"{', '.join(sorted(avoided)) or '(none)'} last. This is a soft preference: use an avoided subject "
+                       "when no valid alternative fills the same requirement. Never apply these preferences to Major requirements. "
+                       "Mention a preferred-subject match briefly in its reason.\n") if preferred or avoided else ""
     prompt = f"""You are an academic advisor at Queens College planning a {term} semester for a {program['name']} ({program['degree']}) student
 who has completed {progress['credits']} credits. {fixed}Pick courses from the ELIGIBLE list only so the whole term has at least {MIN_COURSES} courses
 and {TARGET_CREDITS}-{MAX_CREDITS} credits (so pick about {max(TARGET_CREDITS - lcr, 0)}-{MAX_CREDITS - lcr} more credits, {max(MIN_COURSES - len(locked), 0)} or more courses).
 Balance major courses with Pathways (general education) courses, prefer courses that unlock the most major courses, and
 avoid more than 2 courses of the same subject. Never take a course only to reach a later general-education or Writing
 Intensive course: fill each Pathways or Writing Intensive slot with the lowest-level course that fits it directly. List them most important first.
-{sched}Return ONLY JSON: {{"courses": [{{"id": "<id>", "reason": "<one short sentence for the student>"}}]}}
+{preference_rule}{sched}Return ONLY JSON: {{"courses": [{{"id": "<id>", "reason": "<one short sentence for the student>"}}]}}
 
 ELIGIBLE (id | course | credits | why it is needed | meeting time | what it unlocks):
 """ + "\n".join(lines)
@@ -385,7 +412,16 @@ ELIGIBLE (id | course | credits | why it is needed | meeting time | what it unlo
         print("gemini failed:", e)
         return None
     valid = {c["id"]: c for c in cands}
-    out = [dict(valid[x["id"]], reason=x.get("reason") or valid[x["id"]]["reason"]) for x in chosen if isinstance(x, dict) and x.get("id") in valid]
+    out = []
+    for x in chosen:
+        if not isinstance(x, dict) or x.get("id") not in valid:
+            continue
+        c = valid[x["id"]]
+        reason = x.get("reason") or c["reason"]
+        subject = courses[c["id"]]["subject"]
+        if "matches your " in c["reason"] and f"{subject} preference" not in reason:
+            reason += f"; matches your {subject} preference"
+        out.append(dict(c, reason=reason))
     return list({p["id"]: p for p in out}.values()) or None       # Gemini sometimes repeats a course
 
 
@@ -398,7 +434,7 @@ def unlocks(cid, base, program):
                   key=lambda o: (o not in major_ids, courses[o]["code"]))
 
 
-_cache = {}   # ponytail: in-memory, per process; (program, terms, term, locked) -> response. Restart clears it.
+_cache = {}   # ponytail: in-memory, per process; inputs include availability/preferences. Restart clears it.
 
 
 def suggest(body):
@@ -407,15 +443,17 @@ def suggest(body):
     terms = body.get("terms") or ([body["taken"]] if body.get("taken") else [])   # ordered approved terms (or a flat list)
     taken = {i for t in terms for i in t}
     avail = body.get("avail") or None
-    cands, progress = candidates(program, taken, term, avail)
+    preferences = body.get("preferences") or None
+    preferred, avoided = preference_subjects(preferences)
+    cands, progress = candidates(program, taken, term, avail, preferences)
     valid = {c["id"]: c for c in cands}
     locked = [valid[i] for i in dict.fromkeys(body.get("pins", []) + body.get("queue", [])) if i in valid]
     key = (body["program"], tuple(tuple(t) for t in terms), term, tuple(c["id"] for c in locked),
-           json.dumps(avail, sort_keys=True))
+           json.dumps(avail, sort_keys=True), tuple(sorted(preferred)), tuple(sorted(avoided)))
     if not body.get("fresh") and key in _cache:
         return _cache[key]
     lcr = sum(courses[c["id"]]["credits"] for c in locked)
-    order = None if lcr >= TARGET_CREDITS and len(locked) >= MIN_COURSES else gemini_order(program, term, cands, locked, progress, avail)
+    order = None if lcr >= TARGET_CREDITS and len(locked) >= MIN_COURSES else gemini_order(program, term, cands, locked, progress, avail, preferences)
     picked = pick(cands, taken, locked, order or ())
     base = taken | {c["id"] for c in picked}
     for c in cands:                                    # recompute against the chosen term (candidates() used taken only)

@@ -74,6 +74,28 @@ w = [x for x in r["candidates"] if x["reason"] == "Writing Intensive requirement
 assert all(s.level(a["id"]) <= s.level(b["id"]) for a, b in zip(w, w[1:])), [s.courses[x["id"]]["code"] for x in w[:5]]
 print("pathways matching + W OK")
 
+# elective subject preferences are soft tie-breakers for flexible requirements only
+preferred, _ = s.candidates(s.programs["CSCI-BS"], set(), "Fall", preferences={"preferredSubjects": ["PSYCH"]})
+mqr = [x for x in preferred if x["reason"].startswith("Pathways: Math & Quantitative Reasoning")]
+assert s.courses[mqr[0]["id"]]["subject"] == "PSYCH", [s.courses[x["id"]]["code"] for x in mqr[:5]]
+assert "matches your PSYCH preference" in mqr[0]["reason"]
+
+avoided, _ = s.candidates(s.programs["CSCI-BS"], set(), "Fall", preferences={"avoidedSubjects": ["ASTR"]})
+lps = [x for x in avoided if x["reason"].startswith("Pathways: Life & Physical Sciences")]
+subjects = [s.courses[x["id"]]["subject"] for x in lps]
+assert "ASTR" in subjects and subjects.index("ASTR") > next(i for i, subject in enumerate(subjects) if subject != "ASTR"), subjects
+
+plain, _ = s.candidates(s.programs["CSCI-BS"], set(), "Fall")
+major_plain = [(x["id"], x["score"]) for x in plain if x["reason"].startswith("Major")]
+major_preferred = [(x["id"], x["score"]) for x in preferred if x["reason"].startswith("Major")]
+assert major_preferred == major_plain
+
+# preferences participate in cache identity while omission remains backward compatible
+base = s.suggest({"program": "CSCI-BS", "terms": [], "term": "Fall"})
+with_preferences = s.suggest({"program": "CSCI-BS", "terms": [], "term": "Fall", "preferences": {"preferredSubjects": ["PSYCH"]}})
+assert with_preferences is not base
+print("elective preferences OK")
+
 # ---- schedules & availability (backend/sections.py) ---------------------------------------------------
 if s.sections:
     # offered() is now driven by real sections, not the catalog's "Fall, Spring" prose

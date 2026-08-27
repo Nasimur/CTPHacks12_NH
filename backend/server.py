@@ -13,6 +13,7 @@ the eligible set, and its picks go through the same guards as the rule-based pic
 partner, one course per Pathways slot). Responses are cached per input; "fresh" bypasses the cache (Regenerate).
 """
 import csv, json, os, re, urllib.request
+from collections import Counter
 from io import BytesIO
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -25,15 +26,30 @@ TARGET_CREDITS, MAX_CREDITS, MIN_COURSES = 15, 20, 5   # aim for ~15 cr and >=5 
 courses = {c["id"]: c for c in json.loads((DATA / "courses.json").read_text(encoding="utf8"))}
 programs = {p["id"]: p for p in json.loads((DATA / "programs.json").read_text(encoding="utf8"))}
 prereqs = json.loads((DATA / "prereqs.json").read_text(encoding="utf8")) if (DATA / "prereqs.json").exists() else {}
+by_code = {c["code"]: c["id"] for c in courses.values()}
+# CS department's approved non-CS electives (cs.qc.cuny.edu/approved_nonCSelective.html): at most ONE may count toward
+# the CSCI elective credits, and not if it already satisfies the math requirement (the fixed-course filter below handles that).
+# Coursedog's "Computer Science Electives" set omits them, so they're spliced in here rather than in the scraped data.
+NONCS_ELECTIVES = ("BIOL 330 MATH 202 MATH 223 MATH 224 MATH 231 MATH 232 MATH 242 MATH 245 MATH 247 MATH 248 MATH 301 MATH 317 "
+                   "MATH 337 MATH 341 MATH 342 MATH 609 MATH 613 MATH 619 MATH 621 MATH 623 MATH 624 MATH 625 MATH 626 MATH 633 "
+                   "MATH 634 MATH 635 MATH 636 PHYS 225 PHYS 227 PHYS 265 PHYS 311")
+_noncs = [by_code[c] for c in re.findall(r"[A-Z]+ \d+", NONCS_ELECTIVES) if c in by_code]
+for _pid in ("CSCI-BS", "CSCI-BA"):
+    for _r in programs.get(_pid, {"requirements": []})["requirements"]:
+        for _ru in _r["rules"]:
+            if _ru.get("set") and _ru["kind"] == "credits":
+                _ru["options"] += [[i] for i in _noncs if [i] not in _ru["options"]]
+                _ru["cap"] = {"ids": _noncs, "n": 1}
 for _p in programs.values():                                   # a course required elsewhere in the major can't also be an elective
     _fixed = {i for r in _p["requirements"] for ru in r["rules"] if not ru.get("set") for o in ru["options"] for i in o}
     for r in _p["requirements"]:
         for ru in r["rules"]:
             if ru.get("set"):
                 ru["options"] = [o for o in ru["options"] if not set(o) & _fixed]
+                if ru.get("cap"):                                  # a required MATH course can't consume the one non-CS slot
+                    ru["cap"]["ids"] = [i for i in ru["cap"]["ids"] if i not in _fixed]
 coreqs = set(json.loads((DATA / "coreqs.json").read_text())) if (DATA / "coreqs.json").exists() else set()
 source = json.loads((DATA / "prereq_source.json").read_text()) if (DATA / "prereq_source.json").exists() else {}   # provenance
-by_code = {c["code"]: c["id"] for c in courses.values()}
 
 TERM_ORDER = {"Winter": 0, "Spring": 1, "Summer": 2, "Fall": 3}
 NON_COMPLETION_GRADES = {"F", "FIN", "W", "WA", "WD", "WN", "WU", "INC", "IP", "NC", "AUD"}
@@ -43,6 +59,12 @@ COURSE_ROW = re.compile(
     r"(?:\((\d+(?:\.\d+)?)\)|(\d+(?:\.\d+)?))\s+"
     r"(FALL|SPRING|SUMMER|WINTER)\s+(\d{4})"
 )
+COURSE_CODE = re.compile(r"\b[A-Z]{2,5}\s+\d{1,4}[A-Z]?\b")
+GREEN = (0.0, 0.502, 0.302)
+
+
+TRANSFER_ROW = re.compile(r"Satisfied by:\s*-\s*(.+?)\s*$")
+NOT_APPLIED = re.compile(r"\s*(Elective Courses Not Allowed|Fall-?through|Insufficient Grades|In-progress|Not Counted)\b")
 
 
 def norm(s):
@@ -66,25 +88,43 @@ def program_from_audit(text):
 
 def parse_degreeworks_text(text):
     program_id, major_label, degree_label = program_from_audit(text)
-    seen, parsed, grouped = set(), [], {}
+    seen, parsed, grouped, last = set(), [], {}, None
     for line in text.splitlines():
+        if NOT_APPLIED.match(line):     # everything after these headers is listed but applies to no requirement
+            break
+        transfer = TRANSFER_ROW.search(line)
+        if transfer and parsed:
+            school = transfer.group(1).strip()
+            parsed[-1]["transfer"] = school
+            grouped[parsed[-1]["key"]].setdefault("transfers", {})[parsed[-1]["id"]] = school
+            continue
         for m in COURSE_ROW.finditer(line):
             code = f"{m.group(1)} {m.group(2)}"
             cid = by_code.get(code)
-            if not cid:
-                continue
             grade = m.group(4)
             credits = float(m.group(5) or m.group(6) or 0)
-            if grade in NON_COMPLETION_GRADES or credits <= 0:
+            # No grade floor here: DegreeWorks already applies each department's floor by moving a low grade into the
+            # "Not Allowed" block (cut off above) or zeroing its credits. IP rows DO apply — DegreeWorks counts them.
+            if (grade in NON_COMPLETION_GRADES and grade != "IP") or credits <= 0:
                 continue
             term = m.group(7).title()
             year = int(m.group(8))
             key = (year, TERM_ORDER[term])
-            grouped.setdefault(key, {"name": f"{term} {year}", "kind": term, "courses": []})
-            if (cid, key) not in seen:
-                grouped[key]["courses"].append(cid)
-                seen.add((cid, key))
-            parsed.append({"id": cid, "code": code, "grade": grade, "credits": credits, "term": term, "year": year})
+            grouped.setdefault(key, {"name": f"{term} {year}", "kind": term, "courses": [], "extra": 0})
+            # DegreeWorks lists the same course in several requirement blocks; count it once per line-item, not once per block.
+            # ponytail: repeated placeholder rows (ARTS 499 x6) are consecutive, cross-block repeats never are — consecutive = distinct
+            row = (code, grade, credits, key)
+            if row in seen and last != (code, key):
+                continue
+            seen.add(row)
+            last = (code, key)
+            if not cid:                                            # not in our catalog (e.g. a transfer-only code) — credits still count
+                grouped[key]["extra"] += credits
+                continue
+            grouped[key]["courses"].append(cid)
+            parsed.append({"id": cid, "code": code, "grade": grade, "credits": credits, "term": term, "year": year, "transfer": None, "key": key})
+    for p in parsed:
+        del p["key"]
     return {
         "program": program_id,
         "major": major_label or None,
@@ -101,6 +141,180 @@ def extract_audit_pdf(data):
         raise RuntimeError("Install pypdf first: python -m pip install -r backend/requirements.txt") from e
     reader = PdfReader(BytesIO(data))
     return "\n".join(page.extract_text() or "" for page in reader.pages)
+
+
+def _mmul(a, b):
+    return (
+        a[0] * b[0] + a[2] * b[1],
+        a[1] * b[0] + a[3] * b[1],
+        a[0] * b[2] + a[2] * b[3],
+        a[1] * b[2] + a[3] * b[3],
+        a[0] * b[4] + a[2] * b[5] + a[4],
+        a[1] * b[4] + a[3] * b[5] + a[5],
+    )
+
+
+def _pt(m, x, y):
+    return m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]
+
+
+def _color(vals):
+    try:
+        return tuple(round(float(v), 4) for v in vals)
+    except Exception:
+        return ()
+
+
+def _green(c):
+    return len(c) == 3 and all(abs(a - b) < 0.02 for a, b in zip(c, GREEN))
+
+
+def _page_text_lines(page, pageno):
+    fragments = []
+
+    def visitor(text, cm, tm, font_dict, font_size):
+        t = " ".join(text.split())
+        if not t:
+            return
+        m = _mmul(tuple(float(x) for x in cm), tuple(float(x) for x in tm))
+        fragments.append({"page": pageno, "x": m[4], "y": m[5], "font": float(font_size), "text": t})
+
+    page.extract_text(visitor_text=visitor)
+    rows = []
+    for frag in sorted(fragments, key=lambda f: (-f["y"], f["x"])):
+        row = next((r for r in rows if abs(r["y"] - frag["y"]) <= 2.5), None)
+        if not row:
+            row = {"page": pageno, "y": frag["y"], "x": frag["x"], "font": frag["font"], "parts": []}
+            rows.append(row)
+        row["x"] = min(row["x"], frag["x"])
+        row["font"] = max(row["font"], frag["font"])
+        row["parts"].append(frag)
+    for row in rows:
+        row["text"] = " ".join(p["text"] for p in sorted(row["parts"], key=lambda p: p["x"]))
+        row["codes"] = [c for c in COURSE_CODE.findall(row["text"]) if c in by_code]
+        row["green"] = False
+    return rows
+
+
+def _green_marks(page, reader):
+    from pypdf.generic import ContentStream
+
+    marks, path, stack = [], [], [{"ctm": (1, 0, 0, 1, 0, 0), "fill": (), "stroke": ()}]
+    contents = page.get_contents()
+    if contents is None:
+        return marks
+    for operands, op in ContentStream(contents, reader).operations:
+        op = op.decode() if isinstance(op, bytes) else op
+        st = stack[-1]
+        if op == "q":
+            stack.append({"ctm": st["ctm"], "fill": st["fill"], "stroke": st["stroke"]})
+        elif op == "Q":
+            if len(stack) > 1:
+                stack.pop()
+        elif op == "cm":
+            st["ctm"] = _mmul(st["ctm"], tuple(float(x) for x in operands))
+        elif op == "rg":
+            st["fill"] = _color(operands)
+        elif op == "RG":
+            st["stroke"] = _color(operands)
+        elif op == "g":
+            st["fill"] = (round(float(operands[0]), 4),)
+        elif op == "G":
+            st["stroke"] = (round(float(operands[0]), 4),)
+        elif op in ("m", "l"):
+            path.append(_pt(st["ctm"], float(operands[0]), float(operands[1])))
+        elif op == "c":
+            for i in (0, 2, 4):
+                path.append(_pt(st["ctm"], float(operands[i]), float(operands[i + 1])))
+        elif op == "re":
+            x, y, w, h = [float(v) for v in operands]
+            path += [_pt(st["ctm"], px, py) for px, py in ((x, y), (x + w, y), (x + w, y + h), (x, y + h))]
+        elif op in ("f", "F", "f*", "S", "B", "B*"):
+            fill = op in ("f", "F", "f*", "B", "B*")
+            stroke = op in ("S", "B", "B*")
+            if path and ((fill and _green(st["fill"])) or (stroke and _green(st["stroke"]))):
+                xs, ys = [p[0] for p in path], [p[1] for p in path]
+                x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+                if 5 <= x1 - x0 <= 14 and 5 <= y1 - y0 <= 14 and x0 < 70:
+                    marks.append({"x": (x0 + x1) / 2, "y": (y0 + y1) / 2})
+            path = []
+        elif op == "n":
+            path = []
+    return marks
+
+
+def _titleish(line):
+    text = line["text"].strip()
+    if not text or COURSE_CODE.search(text) or text.startswith(("Still needed:", "Credits applied:", "Course Title")):
+        return False
+    if text.isupper() and len(text) >= 4:
+        return True
+    return line["font"] >= 12 and not any(x in text for x in ("Credits applied", "Course Title"))
+
+
+def _codes_between(lines, start, title):
+    out, seen = [], set()
+    collected = False
+    last_code_y = None
+    start_x = lines[start]["x"]
+    broad = "MATH REQUIREMENT" in title.upper()
+    broad_floor = None
+    if broad:
+        boundary = next((line for line in lines[start + 1:] if line["text"].strip().startswith(("Electives", "Insufficient Grades", "In-progress", "Legend"))), None)
+        broad_floor = boundary["y"] + 14 if boundary else None
+    else:
+        green_labels = [line for line in lines[start + 1:] if line.get("green") and not line["codes"] and line["x"] <= start_x + 8]
+        broad_floor = green_labels[1]["y"] + 14 if len(green_labels) > 1 else None
+    for line in lines[start + 1:]:
+        text = line["text"].strip()
+        if broad_floor is not None and line["y"] <= broad_floor:
+            break
+        if text.startswith(("Still needed:", "Insufficient Grades", "In-progress", "Course Title", "Legend")):
+            break
+        if broad and text.startswith("Electives"):
+            break
+        if not broad and collected and line.get("green") and not line["codes"] and line["x"] <= start_x + 8 and (last_code_y is None or last_code_y - line["y"] > 14):
+            break
+        if not broad and collected and _titleish(line):
+            break
+        for code in line["codes"]:
+            if code not in seen:
+                out.append(by_code[code])
+                seen.add(code)
+                collected = True
+                last_code_y = line["y"]
+    return out
+
+
+def extract_completed_requirements(data):
+    from pypdf import PdfReader
+
+    reader = PdfReader(BytesIO(data))
+    completed = []
+    for pageno, page in enumerate(reader.pages, 1):
+        lines = _page_text_lines(page, pageno)
+        marks = _green_marks(page, reader)
+        for line in lines:
+            line["green"] = any(abs(line["y"] - mark["y"]) <= 5 and abs(line["x"] - mark["x"]) <= 45 for mark in marks)
+        page_titles = []
+        for i, line in enumerate(lines):
+            text = re.sub(r"\s+(COMPLETE|STILL NEEDED)$", "", line["text"]).strip()
+            if not (_titleish(line) and (line["green"] or line["text"].endswith(" COMPLETE"))):
+                continue
+            courses_for_req = _codes_between(lines, i, text)
+            if courses_for_req or "REQUIREMENT" in text.upper():
+                page_titles.append({"title": text, "x": line["x"], "idx": i, "courses": courses_for_req})
+        for item in page_titles:
+            parent = next((p["title"] for p in reversed(page_titles) if p["idx"] < item["idx"] and p["x"] < item["x"] - 2), None)
+            completed.append({"title": item["title"], "parent": parent, "courses": item["courses"], "page": pageno})
+    return completed
+
+
+def parse_audit_pdf(data):
+    text = extract_audit_pdf(data)
+    audit = parse_degreeworks_text(text)
+    audit["completedRequirements"] = extract_completed_requirements(data)
+    return audit
 
 
 def multipart_file(headers, data):
@@ -196,20 +410,97 @@ def pathways(taken):
 
 
 # ---- Major requirements ----------------------------------------------------------------------------
-def major_progress(program, taken):
+def audit_reqs(body_or_reqs):
+    reqs = body_or_reqs if isinstance(body_or_reqs, list) else body_or_reqs.get("auditRequirements", [])
+    out = []
+    for req in reqs or []:
+        if not isinstance(req, dict):
+            continue
+        ids = [cid for cid in req.get("courses", []) if cid in courses]
+        out.append({"title": str(req.get("title") or ""), "parent": req.get("parent"), "courses": ids,
+                    "page": req.get("page") if isinstance(req.get("page"), int) else None})
+    return out
+
+
+def is_math_req(req):
+    return "math" in norm(req["name"])
+
+
+def is_calculus_option(option):
+    return any(courses[i]["subject"] == "MATH" and "calculus" in courses[i]["name"].lower() for i in option if i in courses)
+
+
+def audit_suppressed(program, audit_requirements):
+    reqs = audit_reqs(audit_requirements)
+    titles = [norm(r["title"]) for r in reqs if r["courses"]]
+    suppressed = set()
+    for req in program["requirements"]:
+        if not is_math_req(req):
+            continue
+        all_options = [o for rule in req["rules"] for o in rule["options"]]
+        if any(t == "calculusrequirement" for t in titles):
+            suppressed |= {i for o in all_options if is_calculus_option(o) for i in o}
+        elif any(t == "mathrequirement" for t in titles):
+            suppressed |= {i for o in all_options for i in o}
+    return suppressed
+
+
+def math_audit_completions(audit_requirements):
+    calc_done = [r for r in audit_requirements if norm(r["title"]) == "calculusrequirement" and r["courses"]]
+    math_done = [r for r in audit_requirements if norm(r["title"]) == "mathrequirement" and r["courses"]]
+    return calc_done or math_done
+
+
+def major_progress(program, taken, audit_requirements=None):
+    """`taken` may be a set or a {courseId: times_taken} Counter; repeatable courses (CSCI 381 x3) count every time
+    toward credit-kind rules, once toward count-kind rules."""
+    times = taken if isinstance(taken, dict) else {i: 1 for i in taken}
+    audit_requirements = audit_reqs(audit_requirements or [])
     out = []
     for req in program["requirements"]:
         have = need = 0
         completed, missing = [], []   # completed/todo options (OR-groups)
+        audit_completed = []
         for rule in req["rules"]:
-            sat = [o for o in rule["options"] if any(i in taken for i in o)]
+            # cap: {"ids", "n"} — at most n of these ids count; once met, the rest neither count nor show as missing
+            cap, blocked = rule.get("cap"), set()
+            if cap:
+                got = [i for i in cap["ids"] if i in taken]
+                if len(got) >= cap["n"]:
+                    blocked = set(cap["ids"]) - set(got[:cap["n"]])
+            ok = lambda i: i in taken and i not in blocked
+            sat = [o for o in rule["options"] if any(ok(i) for i in o)]
             need += rule["n"]
-            have += sum(courses[next(i for i in o if i in taken)]["credits"] for o in sat) if rule["kind"] == "credits" else min(len(sat), rule["n"])
-            completed += [[i for i in o if i in taken] for o in sat]
+            have += sum(courses[i]["credits"] * times[i] for o in sat for i in o if ok(i)) if rule["kind"] == "credits" else min(len(sat), rule["n"])
+            completed += [[i for i in o if ok(i)] for o in sat]
             if have < need:
-                missing += [o for o in rule["options"] if o not in sat]
-        out.append({"name": req["name"], "have": have, "need": need, "set": next((r["set"] for r in req["rules"] if r.get("set")), None),
-                    "unit": "credits" if any(r["kind"] == "credits" for r in req["rules"]) else "courses", "completed": completed, "missing": missing})
+                missing += [o for o in rule["options"] if o not in sat and not set(o) <= blocked]
+        if is_math_req(req):
+            audit_math_done = math_audit_completions(audit_requirements)
+            calc_done = [r for r in audit_math_done if norm(r["title"]) == "calculusrequirement"]
+            if calc_done and missing:
+                covered = [o for o in missing if is_calculus_option(o)]
+                if covered:
+                    missing = [o for o in missing if o not in covered]
+                    have += len(covered)
+                    audit_completed += calc_done
+                    if not missing:
+                        have = max(have, need)
+            elif audit_math_done and norm(audit_math_done[0]["title"]) == "mathrequirement":
+                missing = []
+                have = max(have, need)
+                audit_completed += audit_math_done
+        completed_keys = {tuple(o) for o in completed}
+        for req_done in audit_completed:
+            key = tuple(req_done["courses"])
+            if key and key not in completed_keys:
+                completed.append(req_done["courses"])
+                completed_keys.add(key)
+        item = {"name": req["name"], "have": have, "need": need, "set": next((r["set"] for r in req["rules"] if r.get("set")), None),
+                "unit": "credits" if any(r["kind"] == "credits" for r in req["rules"]) else "courses", "completed": completed, "missing": missing}
+        if audit_completed:
+            item["auditCompleted"] = audit_completed
+        out.append(item)
     return out
 
 
@@ -326,10 +617,12 @@ def preference_subjects(preferences):
     return preferred, clean("avoidedSubjects") - preferred
 
 
-def candidates(program, taken, term, avail=None, preferences=None):
+def candidates(program, taken, term, avail=None, preferences=None, audit_requirements=None):
+    times = Counter(taken)            # multiplicity matters for credit-kind rules only
     taken = set(taken)
     preferred, avoided = preference_subjects(preferences)
-    major = major_progress(program, taken)
+    audit_requirements = audit_reqs(audit_requirements or [])
+    major = major_progress(program, times, audit_requirements)
     slots = pathways(taken)
     open_slots = [(s["slot"], s["label"], fit) for s, (_, _, fit) in zip(slots, SLOTS) if not s["course"]]
     need_w = sum(1 for s in slots if s["slot"].startswith("W") and not s["course"])
@@ -337,9 +630,10 @@ def candidates(program, taken, term, avail=None, preferences=None):
     major_subjects = {courses[i]["subject"] for i in major_ids if i in courses}
     eligible = {cid for cid in courses if cid not in taken and prereqs_met(cid, taken)}
     eligible |= {cid for cid in coreqs if cid not in taken and prereqs_met(cid, taken | eligible)}   # coreq: pair with a same-term course
+    suppressed = audit_suppressed(program, audit_requirements)
     out = []
     for cid, c in courses.items():
-        if cid not in eligible or not offered(cid, term) or c["credits"] == 0:
+        if cid in suppressed or cid not in eligible or not offered(cid, term) or c["credits"] == 0:
             continue
         secs = available(cid, term, avail)
         if secs == []:                       # has real sections, none the student can attend -- drop it
@@ -524,15 +818,18 @@ def suggest(body):
     program = programs[body["program"]]
     term = body.get("term", "Fall")
     terms = body.get("terms") or ([body["taken"]] if body.get("taken") else [])   # ordered approved terms (or a flat list)
-    taken = {i for t in terms for i in t}
+    times = Counter(i for t in terms for i in t)   # multiplicity: repeated courses count toward credit rules
+    taken = set(times)
     avail = body.get("avail") or None
     preferences = body.get("preferences") or None
     preferred, avoided = preference_subjects(preferences)
-    cands, progress = candidates(program, taken, term, avail, preferences)
+    audit_requirements = audit_reqs(body)
+    cands, progress = candidates(program, times, term, avail, preferences, audit_requirements)
     valid = {c["id"]: c for c in cands}
     locked = [valid[i] for i in dict.fromkeys(body.get("pins", []) + body.get("queue", [])) if i in valid]
     key = (body["program"], tuple(tuple(t) for t in terms), term, tuple(c["id"] for c in locked),
-           json.dumps(avail, sort_keys=True), tuple(sorted(preferred)), tuple(sorted(avoided)))
+           json.dumps(avail, sort_keys=True), tuple(sorted(preferred)), tuple(sorted(avoided)),
+           json.dumps(audit_requirements, sort_keys=True))
     if not body.get("fresh") and key in _cache:
         return _cache[key]
     lcr = sum(courses[c["id"]]["credits"] for c in locked)
@@ -582,7 +879,7 @@ class Handler(BaseHTTPRequestHandler):
                 pdf = multipart_file(self.headers, raw)
                 if not pdf:
                     return self._send({"error": "Upload a DegreeWorks PDF."}, 400)
-                return self._send(parse_degreeworks_text(extract_audit_pdf(pdf)))
+                return self._send(parse_audit_pdf(pdf))
             except Exception as e:
                 return self._send({"error": str(e)}, 400)
         body = json.loads(raw or b"{}")

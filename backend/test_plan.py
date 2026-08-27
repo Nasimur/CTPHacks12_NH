@@ -1,5 +1,6 @@
 """Self-check for the planner: python backend/test_plan.py"""
 import os
+from pathlib import Path
 os.environ.pop("GEMINI_API_KEY", None)          # deterministic: rule-based picker only
 import server as s
 
@@ -33,9 +34,31 @@ Software Engineering CSCI 370 Software Engineering W 0 SPRING 2026
 CSCI 320 Theory of Computation F 0 FALL 2025
 """)
 assert audit["program"] == "CSCI-BA", audit
-assert [t["name"] for t in audit["terms"]] == ["Fall 2023", "Spring 2024"], audit["terms"]
-assert audit["terms"][0]["courses"] == cs("CSCI 111") and audit["terms"][1]["courses"] == cs("CSCI 211"), audit["terms"]
-assert {c["code"] for c in audit["courses"]} == {"CSCI 111", "CSCI 211"}, audit["courses"]
+assert [t["name"] for t in audit["terms"]] == ["Fall 2023", "Spring 2024", "Fall 2026"], audit["terms"]   # IP applies (DegreeWorks counts it); W/F do not
+assert audit["terms"][0]["courses"] == cs("CSCI 111") and audit["terms"][1]["courses"] == cs("CSCI 211") and audit["terms"][2]["courses"] == cs("CSCI 331"), audit["terms"]
+assert {c["code"] for c in audit["courses"]} == {"CSCI 111", "CSCI 211", "CSCI 331"}, audit["courses"]
+# approved non-CS electives: one counts toward CSCI electives, a second does not
+el = lambda taken: next(m for m in s.major_progress(s.programs["CSCI-BS"], set(taken)) if "Electives" in m["name"])
+assert el(cs("MATH 245"))["have"] == 3, el(cs("MATH 245"))
+assert len(el(cs("MATH 245", "MATH 202"))["completed"]) == 1, el(cs("MATH 245", "MATH 202"))   # only one of them counts
+assert not any(by_code["MATH 202"] in o for o in el(cs("MATH 245"))["missing"]), "second non-CS elective should not be offered"
+print("non-CS electives OK")
+
+calc_audit = [{"title": "CALCULUS REQUIREMENT", "parent": "MATH REQUIREMENT", "courses": cs("MATH 141", "MATH 142", "MATH 143"), "page": 1}]
+calc_terms = [cs("MATH 120", "MATH 141", "MATH 142", "MATH 143", "MATH 231", "MATH 241")]
+calc_prog = s.suggest({"program": "CSCI-BS", "terms": calc_terms, "term": "Fall", "fresh": True, "auditRequirements": calc_audit})["progress"]
+calc_math = next(m for m in calc_prog["major"] if m["name"] == "Major Requirements - Math")
+assert calc_math["have"] >= calc_math["need"] and not calc_math["missing"], calc_math
+calc_cands = s.suggest({"program": "CSCI-BS", "terms": calc_terms, "term": "Fall", "fresh": True, "auditRequirements": calc_audit})["candidates"]
+assert not {"MATH 151", "MATH 152"} & {s.courses[x["id"]]["code"] for x in calc_cands}, calc_cands
+
+sample = Path(r"C:\Users\kevin\Downloads\audit-24272623-AM459aY1.pdf")
+if sample.exists():
+    parsed_pdf = s.parse_audit_pdf(sample.read_bytes())
+    by_title = {r["title"]: [s.courses[i]["code"] for i in r["courses"]] for r in parsed_pdf["completedRequirements"]}
+    assert by_title["CALCULUS REQUIREMENT"] == ["MATH 141", "MATH 142", "MATH 143"], by_title.get("CALCULUS REQUIREMENT")
+    assert by_title["MATH REQUIREMENT"] == ["MATH 120", "MATH 231", "MATH 141", "MATH 142", "MATH 143", "MATH 241"], by_title.get("MATH REQUIREMENT")
+    assert "Computer Architecture" not in by_title and "Software Engineering" not in by_title, by_title
 
 # Pathways: one course fills one slot; ENGL 110 only fits EC1; CSCI 111 (SW + College Option Science) goes to College Option
 p = {x["slot"]: x["course"] for x in s.pathways(set(cs("ENGL 110", "CSCI 111")))}

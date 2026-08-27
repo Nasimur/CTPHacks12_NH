@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, MotionConfig, motion } from 'motion/react';
-import type { AuditImport, Availability, Course, Prereqs, Program, Section, SuggestResponse, Suggestion, Term } from './types';
-import { DEGREE_CREDITS, GEOM, bandH, nextTerm, pos } from './plan';
+import type { AuditImport, AuditRequirement, Availability, Course, Prereqs, Program, Section, SuggestResponse, Suggestion, Term } from './types';
+import { COLS, DEGREE_CREDITS, GEOM, bandH, nextTerm, pos } from './plan';
 import './App.css';
 
 const load = <T,>(f: string, fallback: T): Promise<T> => fetch(`/data/${f}`).then(r => (r.ok ? r.json() : fallback)).catch(() => fallback);
@@ -58,6 +58,7 @@ export default function App() {
   const [source, setSource] = useState<Record<string, string>>({});   // courseId -> where its prereqs came from (verified)
   const [coreqs, setCoreqs] = useState<Set<string>>(new Set());       // may be taken the same term as a prereq
   const [notice, setNotice] = useState('');                           // transient warning (dupe add, etc.)
+  const [dismissedWarn, setDismissedWarn] = useState('');
   const [gened, setGened] = useState<{ labels: Record<string, string>; courses: Record<string, string[]> }>({ labels: {}, courses: {} });
   const [filter, setFilter] = useState({ subject: '', pathway: '', eligible: false });   // add-course box
   const [pid, setPid] = useState<string>(() => store('program') ?? 'CSCI-BS');
@@ -69,6 +70,7 @@ export default function App() {
   // pins: courses locked into the current proposal (survive Regenerate). queue: wanted later — promoted to a pin the first term they're eligible.
   const [pins, setPins] = useState<string[]>(() => store(`pins:${store('program') ?? 'CSCI-BS'}`) ?? []);
   const [queue, setQueue] = useState<string[]>(() => store(`queue:${store('program') ?? 'CSCI-BS'}`) ?? []);
+  const [auditRequirements, setAuditRequirements] = useState<AuditRequirement[]>(() => store(`auditReqs:${store('program') ?? 'CSCI-BS'}`) ?? []);
   const [resp, setResp] = useState<SuggestResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -124,10 +126,21 @@ export default function App() {
     fetch('/api/gened').then(r => r.json()).then(setGened).catch(() => { /* filter just shows no Pathways options */ });
   }, []);
   useEffect(() => {
-    if (store('program') !== pid) { store('program', pid); setTerms(store<Term[]>(`terms:${pid}`) ?? []); setPins(store(`pins:${pid}`) ?? []); setQueue(store(`queue:${pid}`) ?? []); }
+    if (store('program') !== pid) {
+      store('program', pid);
+      setTerms(store<Term[]>(`terms:${pid}`) ?? []);
+      setPins(store(`pins:${pid}`) ?? []);
+      setQueue(store(`queue:${pid}`) ?? []);
+      setAuditRequirements(store<AuditRequirement[]>(`auditReqs:${pid}`) ?? []);
+    }
   }, [pid]);
   useEffect(() => { store(`pins:${pid}`, pins); store(`queue:${pid}`, queue); }, [pid, pins, queue]);
   useEffect(() => { store('ui:left', left); store('ui:right', right); }, [left, right]);
+  useEffect(() => {
+    if (!notice.startsWith('Imported ')) return;
+    const timer = window.setTimeout(() => setNotice(''), 8000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
 
   // Ctrl/Cmd + [  -> left panel,  Ctrl/Cmd + ]  -> right panel
   useEffect(() => {
@@ -144,8 +157,11 @@ export default function App() {
   const program = programs.find(p => p.id === pid);
   const taken = useMemo(() => terms.flatMap(t => t.courses), [terms]);
   const current = useMemo(() => nextTerm(terms, breaks), [terms, breaks]);
-  const done = resp ? resp.progress.credits >= DEGREE_CREDITS : false;
   const credits = (ids: string[]) => ids.reduce((s, id) => s + (courses.get(id)?.credits ?? 0), 0);
+  // done = what DegreeWorks calls complete: credit total AND every major rule AND every Pathways slot
+  const extra = terms.reduce((s, t) => s + (t.extra ?? 0), 0);
+  const done = !!resp && credits(taken) + extra >= DEGREE_CREDITS
+    && resp.progress.major.every(m => m.have >= m.need) && resp.progress.pathways.every(s => s.course);
   /** Has the student actually narrowed anything? If not we send no `avail` at all, so the filter is inert. */
   const availNarrowed = avail.busy.length > 0 || avail.earliest > 0 || avail.latest < 24 * 60;
   /** True once we are past the term the registrar has published: times are then a season pattern, not a booking. */
@@ -181,7 +197,7 @@ export default function App() {
     const ctl = new AbortController();
     const { pins, queue } = latest.current;
     const hasPreferences = preferences.preferredSubjects.length > 0 || preferences.avoidedSubjects.length > 0;
-    const body = { program: pid, terms: terms.map(t => t.courses), term: current.kind, pins, queue,
+    const body = { program: pid, terms: terms.map(t => t.courses), term: current.kind, pins, queue, auditRequirements,
                    fresh: fresh.current, avail: availNarrowed ? avail : null, preferences: hasPreferences ? preferences : undefined };
     fresh.current = false;
     setLoading(true); setError('');
@@ -190,12 +206,12 @@ export default function App() {
       .then(r => { setResp(r); setProposal(merge(r)); setLoading(false); })
       .catch(e => { if (e.name !== 'AbortError') { setError(`Backend not reachable (${e.message}). Run: python backend/server.py`); setLoading(false); } });
     return () => ctl.abort();
-  }, [pid, taken, current.kind, !!program, avail, preferences]);   // eslint-disable-line react-hooks/exhaustive-deps
+  }, [pid, taken, current.kind, !!program, avail, preferences, auditRequirements]);   // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { store('avail', avail); }, [avail]);
   useEffect(() => { store('preferences', preferences); }, [preferences]);
 
   const approve = () => { if (blocked.length) return; const t = [...terms, { ...current, courses: proposal.map(p => p.id) }]; setTerms(t); store(`terms:${pid}`, t); setPins([]); };
-  const reset = () => { setTerms([]); store(`terms:${pid}`, []); setResp(null); setPins([]); setQueue([]); };
+  const reset = () => { setTerms([]); store(`terms:${pid}`, []); setResp(null); setPins([]); setQueue([]); setAuditRequirements([]); store(`auditReqs:${pid}`, []); };
   const undo = () => { const t = terms.slice(0, -1); setTerms(t); store(`terms:${pid}`, t); setPins([]); };
   const regenerate = () => { fresh.current = true; setTerms([...terms]); };   // re-triggers the effect, bypassing the server cache; pins survive
   const remove = (id: string) => { setProposal(proposal.filter(p => p.id !== id)); setPins(pins.filter(p => p !== id)); };
@@ -208,7 +224,6 @@ export default function App() {
     if (c) { if (!proposal.some(p => p.id === id)) setProposal([...proposal, c]); if (!pins.includes(id)) setPins([...pins, id]); setQueue(queue.filter(q => q !== id)); }
     else if (!queue.includes(id)) setQueue([...queue, id]);
   };
-  const defer = (id: string) => { remove(id); if (!queue.includes(id)) setQueue([...queue, id]); };
   const unqueue = (id: string) => setQueue(queue.filter(q => q !== id));
   /** Ghosts are unlocked by `src` in the proposed term: pin `src` (so Regenerate keeps the prerequisite) and queue the ghost for the next eligible term. */
   const enqueue = (id: string, src: string) => {
@@ -251,13 +266,15 @@ export default function App() {
       store(`terms:${audit.program}`, audit.terms);
       store(`pins:${audit.program}`, []);
       store(`queue:${audit.program}`, []);
+      store(`auditReqs:${audit.program}`, audit.completedRequirements ?? []);
       setPid(audit.program);
       setTerms(audit.terms);
       setPins([]);
       setQueue([]);
+      setAuditRequirements(audit.completedRequirements ?? []);
       setProposal([]);
       setResp(null);
-      setNotice(`Imported ${audit.courses.length} completed courses from ${audit.major ?? 'DegreeWorks'}.`);
+      setNotice(`Imported ${audit.courses.length} completed courses and ${(audit.completedRequirements ?? []).length} checked requirements from ${audit.major ?? 'DegreeWorks'}.`);
     } catch (e) {
       setError(`DegreeWorks import failed (${e instanceof Error ? e.message : 'unknown error'}).`);
     } finally {
@@ -267,8 +284,8 @@ export default function App() {
   };
 
   // --- DAG geometry: one band per approved term (top to bottom), then the proposal band, then the queue band ---
-  const levels: { name: string; kind: string; ids: string[]; proposed?: boolean; queued?: boolean }[] = [
-    ...terms.map(t => ({ name: t.name, kind: t.kind, ids: [...new Set(t.courses)] })),   // older saved plans may hold a duplicate
+  const levels: { name: string; kind: string; ids: string[]; proposed?: boolean; queued?: boolean; transfers?: Record<string, string>; cr?: number }[] = [
+    ...terms.map(t => ({ name: t.name, kind: t.kind, ids: [...new Set(t.courses)], transfers: t.transfers, cr: credits(t.courses) + (t.extra ?? 0) })),   // one card per course; credits count every row
     ...(done ? [] : [{ name: current.name, kind: current.kind, ids: proposal.map(p => p.id), proposed: true }]),
     ...(queue.length ? [{ name: 'Queued', kind: 'queue', ids: queue, queued: true }] : []),
   ];
@@ -333,21 +350,30 @@ export default function App() {
   levels.forEach((l, level) => l.ids.forEach((id, i) => place.set(id, { level, i })));
   const edges: { from: string; to: string }[] = [];
   for (const [id, p] of place) for (const g of prereqs[id] ?? []) for (const q of g) if (place.has(q) && place.get(q)!.level < p.level) edges.push({ from: q, to: id });
-  const widest = Math.max(1, ...levels.map(l => l.ids.length));
+  const widest = Math.min(COLS, Math.max(1, ...levels.map(l => l.ids.length)));
   const W = GEOM.PAD * 2 + widest * (GEOM.CARD_W + GEOM.COL_GAP) + GEOM.LABEL_W;
-  const H = GEOM.PAD * 2 + Math.max(1, levels.length) * (bandH + GEOM.ROW_GAP) - GEOM.ROW_GAP;
-  const at = (id: string) => { const p = place.get(id)!; return pos(p.level, p.i, levels[p.level].ids.length, W); };
+  const tops: number[] = [];
+  levels.reduce((y, l) => { tops.push(y); return y + bandH(l.ids.length) + GEOM.ROW_GAP; }, GEOM.PAD);
+  const H = levels.length ? tops[levels.length - 1] + bandH(levels[levels.length - 1].ids.length) + GEOM.PAD : GEOM.PAD * 2 + bandH(0);
+  const at = (id: string) => { const p = place.get(id)!; return pos(tops[p.level], p.i, levels[p.level].ids.length, W); };
   const proposalCredits = credits(proposal.map(p => p.id));
   const courseCodes = (ids: string[]) => ids.map(id => courses.get(id)?.code ?? id).join(' or ');
+  const auditReqText = (a: AuditRequirement) => courseCodes(a.courses);
   const hot = focus ? new Set([focus, ...(prereqs[focus] ?? []).flat(), ...(resp?.candidates.find(c => c.id === focus)?.unlocks ?? [])]) : null;
   const violations = new Map((resp?.violations ?? []).map(v => [v.id, v]));
   const unverified = new Set([...place.keys()].filter(id => courses.has(id) && !verified(id)));
-  const warn = error || notice || (blocked.length ? `Can't approve ${current.name}: ${blocked.map(p => {
+  const rawWarn = error || notice || (blocked.length ? `Can't approve ${current.name}: ${blocked.map(p => {
     const c = courses.get(p.id), g = (prereqs[p.id] ?? []).filter(g => !g.some(q => taken.includes(q)) && !placement(g));
     return `${c?.code} needs ${g.map(x => x.map(q => courses.get(q)?.code).join(' or ')).join(' and ')} in an earlier term`;
   }).join(' · ')}.` : '')
     || (violations.size ? `Prerequisite problems in approved terms: ${[...violations.values()].map(v => `${courses.get(v.id)?.code} needs ${v.missing.map(m => courses.get(m)?.code).join(' or ')} first`).join(' · ')}. Use "Undo" or "Start over".` : '');
-  const totalCredits = resp?.progress.credits ?? credits(taken);
+  const warn = rawWarn === dismissedWarn ? '' : rawWarn;
+  const dismissWarn = () => {
+    if (rawWarn === notice) setNotice('');
+    else if (rawWarn === error) setError('');
+    else setDismissedWarn(rawWarn);
+  };
+  const totalCredits = credits(taken) + extra;   // counted here, not server-side: the server dedupes `taken`, the audit does not
 
   // --- ghosts: up to 3 not-yet-planned courses the hovered one unlocks, fanned below it in a half-wheel ---
   const unlockedBy = useMemo(() => {
@@ -397,10 +423,14 @@ export default function App() {
 
         <AnimatePresence>
           {warn && (
-            <motion.p key="warn" role="alert" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={T.base}
-              className="shrink-0 border-b border-line bg-warning-soft px-4 py-2 text-[13px] text-warning">
-              {warn}
-            </motion.p>
+            <motion.div key="warn" role="alert" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={T.base}
+              className="flex shrink-0 items-center gap-3 border-b border-line bg-warning-soft px-4 py-2 text-[13px] text-warning">
+              <p className="min-w-0 flex-1">{warn}</p>
+              <button type="button" className={`grid h-6 w-6 shrink-0 place-items-center rounded-md border border-warning/30 text-[12px] font-semibold leading-none text-warning transition hover:bg-warning/10 ${ring}`}
+                onClick={dismissWarn} aria-label="Dismiss message" title="Dismiss message">
+                X
+              </button>
+            </motion.div>
           )}
         </AnimatePresence>
 
@@ -435,7 +465,6 @@ export default function App() {
                                 : <p className="text-[12px] text-ink-3">no published schedule</p>}
                               {p.unlocks.length > 0 && <p className="text-[12px] text-ink-3">→ unlocks {p.unlocks.slice(0, 5).map(u => courses.get(u)?.code).join(', ')}</p>}
                             </button>
-                            <button className={`${icon} h-6 w-6 opacity-0 group-hover:opacity-100 focus-visible:opacity-100`} onClick={() => defer(p.id)} aria-label={`Defer ${c?.code} to a later term`} title="Defer to a later term">›</button>
                             <button className={`${icon} h-6 w-6 opacity-0 group-hover:opacity-100 focus-visible:opacity-100`} onClick={() => remove(p.id)} aria-label={`Remove ${c?.code}`} title="Remove">×</button>
                           </motion.li>;
                         })}
@@ -600,13 +629,13 @@ export default function App() {
                     }`}
                   style={{
                     left: GEOM.PAD,
-                    top: pos(i, 0, 1, W).y - GEOM.BAND_PAD,
+                    top: tops[i],
                     width: W - GEOM.PAD * 2,
-                    height: bandH,
+                    height: bandH(l.ids.length),
                   }}>
                   <div className="absolute left-4 top-1/2 -translate-y-1/2 leading-tight">
                     <b className={`block text-[13px] font-semibold ${l.queued ? 'text-ink-2' : ''}`}>{l.name}</b>
-                    <small className="text-[12px] text-ink-2 tabular-nums">{l.queued ? 'when eligible' : `${credits(l.ids)} cr${l.proposed ? ' · proposed' : ''}`}</small>
+                    <small className="text-[12px] text-ink-2 tabular-nums">{l.queued ? 'when eligible' : `${l.cr ?? credits(l.ids)} cr${l.proposed ? ' · proposed' : ''}`}</small>
                   </div>
                 </motion.div>
               ))}
@@ -682,7 +711,7 @@ export default function App() {
                       s?.unlocks.length ? `Unlocks: ${s.unlocks.map(u => courses.get(u)?.code).join(', ')}` : '',
                       (prereqs[id] ?? []).length ? `Prereqs: ${prereqs[id].map(g => g.map(q => courses.get(q)?.code).join(' or ')).join(' and ')}${s?.source ? ` (source: ${s.source})` : ''}`
                         : unverified.has(id) ? 'Prereqs: none found in the catalog — confirm with an advisor' : '',
-                      c.description,
+                      col.transfers?.[id] ? `Transfer Credit from ${col.transfers[id]}` : c.description,
                     ].filter(Boolean).join('\n\n') : id}
                     onMouseEnter={() => enter(id)} onMouseLeave={leave}>
                     <div className={`h-1.5 w-1.5 shrink-0 rounded-full ${tone === 'danger' ? 'bg-danger' : tone === 'warning' ? 'bg-warning' : pinned ? 'bg-accent' : col.proposed || col.queued ? 'bg-line-strong' : 'bg-success'}`} />
@@ -749,20 +778,24 @@ export default function App() {
                 {!resp && <p className="text-ink-3">Requirements appear once a plan loads.</p>}
                 {resp && <>
                   <h3 className="eyebrow mb-1">Major requirements</h3>
-                  {resp.progress.major.map(m => (
-                    <details key={m.name} open={m.have < m.need} className="group/d -mx-2">
-                      <summary className={`flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-[13px] transition hover:bg-surface-hover marker:content-none ${ring}`}>
-                        <span className="w-3 text-ink-3 transition group-open/d:rotate-90" aria-hidden="true">›</span>
-                        <span className="flex-1 font-medium">{m.name.replace('Major Requirements - ', '')}</span>
-                        <span className={`text-[12px] tabular-nums ${m.have >= m.need ? 'text-success' : 'text-ink-2'}`}>{m.have}/{m.need} {m.unit}</span>
-                      </summary>
-                      <ul className="mb-1 columns-2 pl-7 pr-2 text-[12px] text-ink-2">
-                        {(m.completed ?? []).map((o, i) => <li key={`done:${i}`} className="text-success line-through decoration-success/70 decoration-2">{courseCodes(o)}</li>)}
-                        {m.missing.slice(0, 24).map((o, i) => <li key={`todo:${i}`}>{courseCodes(o)}</li>)}
-                        {m.missing.length > 24 && <li>… {m.missing.length - 24} more</li>}
-                      </ul>
-                    </details>
-                  ))}
+                  {resp.progress.major.map(m => {
+                    const auditGroups = new Set((m.auditCompleted ?? []).map(a => a.courses.join('|')));
+                    return (
+                      <details key={m.name} open={m.have < m.need} className="group/d -mx-2">
+                        <summary className={`flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-[13px] transition hover:bg-surface-hover marker:content-none ${ring}`}>
+                          <span className="w-3 text-ink-3 transition group-open/d:rotate-90" aria-hidden="true">›</span>
+                          <span className="flex-1 font-medium">{m.name.replace('Major Requirements - ', '')}</span>
+                          <span className={`text-[12px] tabular-nums ${m.have >= m.need ? 'text-success' : 'text-ink-2'}`}>{m.have}/{m.need} {m.unit}</span>
+                        </summary>
+                        <ul className="mb-1 columns-2 pl-7 pr-2 text-[12px] text-ink-2">
+                          {(m.auditCompleted ?? []).map((a, i) => <li key={`audit:${i}`} className="break-inside-avoid text-success line-through decoration-success/70 decoration-2">{auditReqText(a)}</li>)}
+                          {(m.completed ?? []).filter(o => !auditGroups.has(o.join('|'))).map((o, i) => <li key={`done:${i}`} className="text-success line-through decoration-success/70 decoration-2">{courseCodes(o)}</li>)}
+                          {m.missing.slice(0, 24).map((o, i) => <li key={`todo:${i}`}>{courseCodes(o)}</li>)}
+                          {m.missing.length > 24 && <li>… {m.missing.length - 24} more</li>}
+                        </ul>
+                      </details>
+                    );
+                  })}
                   <h3 className="eyebrow mt-5 mb-1">Pathways</h3>
                   <ul className="-mx-2">{resp.progress.pathways.map(s => (
                     <li key={s.slot} className={`flex items-center gap-2 rounded-md px-2 py-1 text-[13px] transition hover:bg-surface-hover ${s.course ? 'text-ink' : 'text-ink-2'}`}>

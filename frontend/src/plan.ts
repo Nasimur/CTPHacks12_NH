@@ -1,14 +1,20 @@
 import type { Term } from './types';
 
-export const GEOM = { CARD_W: 170, CARD_H: 56, COL_GAP: 28, ROW_GAP: 72, PAD: 24, BAND_PAD: 22, LABEL_W: 120 };
+export const GEOM = { CARD_W: 170, CARD_H: 56, COL_GAP: 28, ROW_GAP: 72, ROW_IN_GAP: 16, PAD: 24, BAND_PAD: 22, LABEL_W: 120 };
 export const DEGREE_CREDITS = 120;
+export const COLS = 5;
 
-/** Level = semester band (top to bottom); a band's courses are centred horizontally within `width`. */
-export const pos = (level: number, i: number, count: number, width: number) => ({
-  x: GEOM.LABEL_W + (width - GEOM.LABEL_W) / 2 + (i - (count - 1) / 2) * (GEOM.CARD_W + GEOM.COL_GAP) - GEOM.CARD_W / 2,
-  y: GEOM.PAD + GEOM.BAND_PAD + level * (GEOM.CARD_H + GEOM.BAND_PAD * 2 + GEOM.ROW_GAP),
-});
-export const bandH = GEOM.CARD_H + GEOM.BAND_PAD * 2;
+export const rowsOf = (count: number) => Math.max(1, Math.ceil(count / COLS));
+export const bandH = (count: number) => rowsOf(count) * GEOM.CARD_H + (rowsOf(count) - 1) * GEOM.ROW_IN_GAP + GEOM.BAND_PAD * 2;
+
+/** Cards wrap into rows of COLS inside a band starting at `top`; the grid is centred horizontally within `width`. */
+export const pos = (top: number, i: number, count: number, width: number) => {
+  const cols = Math.min(COLS, Math.max(1, count)), col = i % COLS, row = Math.floor(i / COLS);
+  return {
+    x: GEOM.LABEL_W + (width - GEOM.LABEL_W) / 2 + (col - (cols - 1) / 2) * (GEOM.CARD_W + GEOM.COL_GAP) - GEOM.CARD_W / 2,
+    y: top + GEOM.BAND_PAD + row * (GEOM.CARD_H + GEOM.ROW_IN_GAP),
+  };
+};
 
 /** Next term after the approved ones: Fall 1, Spring 1, (Summer 1), Fall 2 ... */
 export function nextTerm(terms: Term[], breaks: boolean): Term {

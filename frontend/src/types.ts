@@ -6,7 +6,8 @@ export type Program = { id: string; name: string; degree: string; description: s
 /** courseId -> list of OR-groups (all groups required) */
 export type Prereqs = Record<string, string[][]>;
 
-export type Term = { name: string; kind: 'Fall' | 'Spring' | 'Summer' | 'Winter'; courses: string[] };
+/** transfers: courseId -> school, for credits imported from a DegreeWorks audit that were earned elsewhere */
+export type Term = { name: string; kind: 'Fall' | 'Spring' | 'Summer' | 'Winter'; courses: string[]; transfers?: Record<string, string>; extra?: number };   // extra: credits from audit rows not in our catalog
 /** A real CUNYfirst class section. `start`/`end` are minutes past midnight; null for async/TBA. */
 export type Section = {
   sec: string; component: string; days: string; start: number | null; end: number | null;
@@ -22,9 +23,13 @@ export type Suggestion = {
   sections: Section[] | null;
 };
 export type Violation = { id: string; term: number; missing: string[] };
+export type AuditRequirement = { title: string; parent: string | null; courses: string[]; page: number | null };
 export type Progress = {
   credits: number;
-  major: { name: string; have: number; need: number; unit: string; set: string | null; completed?: string[][]; missing: string[][] }[];
+  major: {
+    name: string; have: number; need: number; unit: string; set: string | null;
+    completed?: string[][]; missing: string[][]; auditCompleted?: AuditRequirement[];
+  }[];
   pathways: { slot: string; label: string; course: string | null }[];
 };
 export type SuggestResponse = {
@@ -38,6 +43,7 @@ export type AuditImport = {
   major: string | null;
   degree: string | null;
   terms: Term[];
-  courses: { id: string; code: string; grade: string; credits: number; term: Term['kind']; year: number }[];
+  courses: { id: string; code: string; grade: string; credits: number; term: Term['kind']; year: number; transfer: string | null }[];
+  completedRequirements: AuditRequirement[];
   error?: string;
 };

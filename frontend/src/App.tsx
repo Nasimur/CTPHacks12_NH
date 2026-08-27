@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, MotionConfig, motion } from 'motion/react';
-import type { AuditImport, Availability, Course, Prereqs, Program, Section, SuggestResponse, Suggestion, Term } from './types';
+import type { AuditImport, AuditRequirement, Availability, Course, Prereqs, Program, Section, SuggestResponse, Suggestion, Term } from './types';
 import { DEGREE_CREDITS, GEOM, bandH, nextTerm, pos } from './plan';
 import './App.css';
 
@@ -55,6 +55,7 @@ export default function App() {
   const [source, setSource] = useState<Record<string, string>>({});   // courseId -> where its prereqs came from (verified)
   const [coreqs, setCoreqs] = useState<Set<string>>(new Set());       // may be taken the same term as a prereq
   const [notice, setNotice] = useState('');                           // transient warning (dupe add, etc.)
+  const [dismissedWarn, setDismissedWarn] = useState('');
   const [gened, setGened] = useState<{ labels: Record<string, string>; courses: Record<string, string[]> }>({ labels: {}, courses: {} });
   const [filter, setFilter] = useState({ subject: '', pathway: '', eligible: false });   // add-course box
   const [pid, setPid] = useState<string>(() => store('program') ?? 'CSCI-BS');
@@ -65,6 +66,7 @@ export default function App() {
   // pins: courses locked into the current proposal (survive Regenerate). queue: wanted later — promoted to a pin the first term they're eligible.
   const [pins, setPins] = useState<string[]>(() => store(`pins:${store('program') ?? 'CSCI-BS'}`) ?? []);
   const [queue, setQueue] = useState<string[]>(() => store(`queue:${store('program') ?? 'CSCI-BS'}`) ?? []);
+  const [auditRequirements, setAuditRequirements] = useState<AuditRequirement[]>(() => store(`auditReqs:${store('program') ?? 'CSCI-BS'}`) ?? []);
   const [resp, setResp] = useState<SuggestResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -120,10 +122,21 @@ export default function App() {
     fetch('/api/gened').then(r => r.json()).then(setGened).catch(() => { /* filter just shows no Pathways options */ });
   }, []);
   useEffect(() => {
-    if (store('program') !== pid) { store('program', pid); setTerms(store<Term[]>(`terms:${pid}`) ?? []); setPins(store(`pins:${pid}`) ?? []); setQueue(store(`queue:${pid}`) ?? []); }
+    if (store('program') !== pid) {
+      store('program', pid);
+      setTerms(store<Term[]>(`terms:${pid}`) ?? []);
+      setPins(store(`pins:${pid}`) ?? []);
+      setQueue(store(`queue:${pid}`) ?? []);
+      setAuditRequirements(store<AuditRequirement[]>(`auditReqs:${pid}`) ?? []);
+    }
   }, [pid]);
   useEffect(() => { store(`pins:${pid}`, pins); store(`queue:${pid}`, queue); }, [pid, pins, queue]);
   useEffect(() => { store('ui:left', left); store('ui:right', right); }, [left, right]);
+  useEffect(() => {
+    if (!notice.startsWith('Imported ')) return;
+    const timer = window.setTimeout(() => setNotice(''), 8000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
 
   // Ctrl/Cmd + [  -> left panel,  Ctrl/Cmd + ]  -> right panel
   useEffect(() => {
@@ -176,7 +189,7 @@ export default function App() {
     if (!program || done) return;
     const ctl = new AbortController();
     const { pins, queue } = latest.current;
-    const body = { program: pid, terms: terms.map(t => t.courses), term: current.kind, pins, queue,
+    const body = { program: pid, terms: terms.map(t => t.courses), term: current.kind, pins, queue, auditRequirements,
                    fresh: fresh.current, avail: availNarrowed ? avail : null };
     fresh.current = false;
     setLoading(true); setError('');
@@ -185,11 +198,11 @@ export default function App() {
       .then(r => { setResp(r); setProposal(merge(r)); setLoading(false); })
       .catch(e => { if (e.name !== 'AbortError') { setError(`Backend not reachable (${e.message}). Run: python backend/server.py`); setLoading(false); } });
     return () => ctl.abort();
-  }, [pid, taken, current.kind, !!program, avail]);   // eslint-disable-line react-hooks/exhaustive-deps
+  }, [pid, taken, current.kind, !!program, avail, auditRequirements]);   // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { store('avail', avail); }, [avail]);
 
   const approve = () => { if (blocked.length) return; const t = [...terms, { ...current, courses: proposal.map(p => p.id) }]; setTerms(t); store(`terms:${pid}`, t); setPins([]); };
-  const reset = () => { setTerms([]); store(`terms:${pid}`, []); setResp(null); setPins([]); setQueue([]); };
+  const reset = () => { setTerms([]); store(`terms:${pid}`, []); setResp(null); setPins([]); setQueue([]); setAuditRequirements([]); store(`auditReqs:${pid}`, []); };
   const undo = () => { const t = terms.slice(0, -1); setTerms(t); store(`terms:${pid}`, t); setPins([]); };
   const regenerate = () => { fresh.current = true; setTerms([...terms]); };   // re-triggers the effect, bypassing the server cache; pins survive
   const remove = (id: string) => { setProposal(proposal.filter(p => p.id !== id)); setPins(pins.filter(p => p !== id)); };
@@ -237,13 +250,15 @@ export default function App() {
       store(`terms:${audit.program}`, audit.terms);
       store(`pins:${audit.program}`, []);
       store(`queue:${audit.program}`, []);
+      store(`auditReqs:${audit.program}`, audit.completedRequirements ?? []);
       setPid(audit.program);
       setTerms(audit.terms);
       setPins([]);
       setQueue([]);
+      setAuditRequirements(audit.completedRequirements ?? []);
       setProposal([]);
       setResp(null);
-      setNotice(`Imported ${audit.courses.length} completed courses from ${audit.major ?? 'DegreeWorks'}.`);
+      setNotice(`Imported ${audit.courses.length} completed courses and ${(audit.completedRequirements ?? []).length} checked requirements from ${audit.major ?? 'DegreeWorks'}.`);
     } catch (e) {
       setError(`DegreeWorks import failed (${e instanceof Error ? e.message : 'unknown error'}).`);
     } finally {
@@ -325,14 +340,21 @@ export default function App() {
   const at = (id: string) => { const p = place.get(id)!; return pos(p.level, p.i, levels[p.level].ids.length, W); };
   const proposalCredits = credits(proposal.map(p => p.id));
   const courseCodes = (ids: string[]) => ids.map(id => courses.get(id)?.code ?? id).join(' or ');
+  const auditReqText = (a: AuditRequirement) => courseCodes(a.courses);
   const hot = focus ? new Set([focus, ...(prereqs[focus] ?? []).flat(), ...(resp?.candidates.find(c => c.id === focus)?.unlocks ?? [])]) : null;
   const violations = new Map((resp?.violations ?? []).map(v => [v.id, v]));
   const unverified = new Set([...place.keys()].filter(id => courses.has(id) && !verified(id)));
-  const warn = error || notice || (blocked.length ? `Can't approve ${current.name}: ${blocked.map(p => {
+  const rawWarn = error || notice || (blocked.length ? `Can't approve ${current.name}: ${blocked.map(p => {
     const c = courses.get(p.id), g = (prereqs[p.id] ?? []).filter(g => !g.some(q => taken.includes(q)) && !placement(g));
     return `${c?.code} needs ${g.map(x => x.map(q => courses.get(q)?.code).join(' or ')).join(' and ')} in an earlier term`;
   }).join(' · ')}.` : '')
     || (violations.size ? `Prerequisite problems in approved terms: ${[...violations.values()].map(v => `${courses.get(v.id)?.code} needs ${v.missing.map(m => courses.get(m)?.code).join(' or ')} first`).join(' · ')}. Use "Undo" or "Start over".` : '');
+  const warn = rawWarn === dismissedWarn ? '' : rawWarn;
+  const dismissWarn = () => {
+    if (rawWarn === notice) setNotice('');
+    else if (rawWarn === error) setError('');
+    else setDismissedWarn(rawWarn);
+  };
   const totalCredits = resp?.progress.credits ?? credits(taken);
 
   // --- ghosts: up to 3 not-yet-planned courses the hovered one unlocks, fanned below it in a half-wheel ---
@@ -383,10 +405,14 @@ export default function App() {
 
         <AnimatePresence>
           {warn && (
-            <motion.p key="warn" role="alert" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={T.base}
-              className="shrink-0 border-b border-line bg-warning-soft px-4 py-2 text-[13px] text-warning">
-              {warn}
-            </motion.p>
+            <motion.div key="warn" role="alert" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={T.base}
+              className="flex shrink-0 items-center gap-3 border-b border-line bg-warning-soft px-4 py-2 text-[13px] text-warning">
+              <p className="min-w-0 flex-1">{warn}</p>
+              <button type="button" className={`grid h-6 w-6 shrink-0 place-items-center rounded-md border border-warning/30 text-[12px] font-semibold leading-none text-warning transition hover:bg-warning/10 ${ring}`}
+                onClick={dismissWarn} aria-label="Dismiss message" title="Dismiss message">
+                X
+              </button>
+            </motion.div>
           )}
         </AnimatePresence>
 
@@ -708,20 +734,24 @@ export default function App() {
                 {!resp && <p className="text-ink-3">Requirements appear once a plan loads.</p>}
                 {resp && <>
                   <h3 className="eyebrow mb-1">Major requirements</h3>
-                  {resp.progress.major.map(m => (
-                    <details key={m.name} open={m.have < m.need} className="group/d -mx-2">
-                      <summary className={`flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-[13px] transition hover:bg-surface-hover marker:content-none ${ring}`}>
-                        <span className="w-3 text-ink-3 transition group-open/d:rotate-90" aria-hidden="true">›</span>
-                        <span className="flex-1 font-medium">{m.name.replace('Major Requirements - ', '')}</span>
-                        <span className={`text-[12px] tabular-nums ${m.have >= m.need ? 'text-success' : 'text-ink-2'}`}>{m.have}/{m.need} {m.unit}</span>
-                      </summary>
-                      <ul className="mb-1 columns-2 pl-7 pr-2 text-[12px] text-ink-2">
-                        {(m.completed ?? []).map((o, i) => <li key={`done:${i}`} className="text-success line-through decoration-success/70 decoration-2">{courseCodes(o)}</li>)}
-                        {m.missing.slice(0, 24).map((o, i) => <li key={`todo:${i}`}>{courseCodes(o)}</li>)}
-                        {m.missing.length > 24 && <li>… {m.missing.length - 24} more</li>}
-                      </ul>
-                    </details>
-                  ))}
+                  {resp.progress.major.map(m => {
+                    const auditGroups = new Set((m.auditCompleted ?? []).map(a => a.courses.join('|')));
+                    return (
+                      <details key={m.name} open={m.have < m.need} className="group/d -mx-2">
+                        <summary className={`flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-[13px] transition hover:bg-surface-hover marker:content-none ${ring}`}>
+                          <span className="w-3 text-ink-3 transition group-open/d:rotate-90" aria-hidden="true">›</span>
+                          <span className="flex-1 font-medium">{m.name.replace('Major Requirements - ', '')}</span>
+                          <span className={`text-[12px] tabular-nums ${m.have >= m.need ? 'text-success' : 'text-ink-2'}`}>{m.have}/{m.need} {m.unit}</span>
+                        </summary>
+                        <ul className="mb-1 columns-2 pl-7 pr-2 text-[12px] text-ink-2">
+                          {(m.auditCompleted ?? []).map((a, i) => <li key={`audit:${i}`} className="break-inside-avoid text-success line-through decoration-success/70 decoration-2">{auditReqText(a)}</li>)}
+                          {(m.completed ?? []).filter(o => !auditGroups.has(o.join('|'))).map((o, i) => <li key={`done:${i}`} className="text-success line-through decoration-success/70 decoration-2">{courseCodes(o)}</li>)}
+                          {m.missing.slice(0, 24).map((o, i) => <li key={`todo:${i}`}>{courseCodes(o)}</li>)}
+                          {m.missing.length > 24 && <li>… {m.missing.length - 24} more</li>}
+                        </ul>
+                      </details>
+                    );
+                  })}
                   <h3 className="eyebrow mt-5 mb-1">Pathways</h3>
                   <ul className="-mx-2">{resp.progress.pathways.map(s => (
                     <li key={s.slot} className={`flex items-center gap-2 rounded-md px-2 py-1 text-[13px] transition hover:bg-surface-hover ${s.course ? 'text-ink' : 'text-ink-2'}`}>

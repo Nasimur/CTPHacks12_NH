@@ -42,6 +42,8 @@ COURSE_ROW = re.compile(
     r"(?:\((\d+(?:\.\d+)?)\)|(\d+(?:\.\d+)?))\s+"
     r"(FALL|SPRING|SUMMER|WINTER)\s+(\d{4})"
 )
+COURSE_CODE = re.compile(r"\b[A-Z]{2,5}\s+\d{1,4}[A-Z]?\b")
+GREEN = (0.0, 0.502, 0.302)
 
 
 def norm(s):
@@ -100,6 +102,180 @@ def extract_audit_pdf(data):
         raise RuntimeError("Install pypdf first: python -m pip install -r backend/requirements.txt") from e
     reader = PdfReader(BytesIO(data))
     return "\n".join(page.extract_text() or "" for page in reader.pages)
+
+
+def _mmul(a, b):
+    return (
+        a[0] * b[0] + a[2] * b[1],
+        a[1] * b[0] + a[3] * b[1],
+        a[0] * b[2] + a[2] * b[3],
+        a[1] * b[2] + a[3] * b[3],
+        a[0] * b[4] + a[2] * b[5] + a[4],
+        a[1] * b[4] + a[3] * b[5] + a[5],
+    )
+
+
+def _pt(m, x, y):
+    return m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]
+
+
+def _color(vals):
+    try:
+        return tuple(round(float(v), 4) for v in vals)
+    except Exception:
+        return ()
+
+
+def _green(c):
+    return len(c) == 3 and all(abs(a - b) < 0.02 for a, b in zip(c, GREEN))
+
+
+def _page_text_lines(page, pageno):
+    fragments = []
+
+    def visitor(text, cm, tm, font_dict, font_size):
+        t = " ".join(text.split())
+        if not t:
+            return
+        m = _mmul(tuple(float(x) for x in cm), tuple(float(x) for x in tm))
+        fragments.append({"page": pageno, "x": m[4], "y": m[5], "font": float(font_size), "text": t})
+
+    page.extract_text(visitor_text=visitor)
+    rows = []
+    for frag in sorted(fragments, key=lambda f: (-f["y"], f["x"])):
+        row = next((r for r in rows if abs(r["y"] - frag["y"]) <= 2.5), None)
+        if not row:
+            row = {"page": pageno, "y": frag["y"], "x": frag["x"], "font": frag["font"], "parts": []}
+            rows.append(row)
+        row["x"] = min(row["x"], frag["x"])
+        row["font"] = max(row["font"], frag["font"])
+        row["parts"].append(frag)
+    for row in rows:
+        row["text"] = " ".join(p["text"] for p in sorted(row["parts"], key=lambda p: p["x"]))
+        row["codes"] = [c for c in COURSE_CODE.findall(row["text"]) if c in by_code]
+        row["green"] = False
+    return rows
+
+
+def _green_marks(page, reader):
+    from pypdf.generic import ContentStream
+
+    marks, path, stack = [], [], [{"ctm": (1, 0, 0, 1, 0, 0), "fill": (), "stroke": ()}]
+    contents = page.get_contents()
+    if contents is None:
+        return marks
+    for operands, op in ContentStream(contents, reader).operations:
+        op = op.decode() if isinstance(op, bytes) else op
+        st = stack[-1]
+        if op == "q":
+            stack.append({"ctm": st["ctm"], "fill": st["fill"], "stroke": st["stroke"]})
+        elif op == "Q":
+            if len(stack) > 1:
+                stack.pop()
+        elif op == "cm":
+            st["ctm"] = _mmul(st["ctm"], tuple(float(x) for x in operands))
+        elif op == "rg":
+            st["fill"] = _color(operands)
+        elif op == "RG":
+            st["stroke"] = _color(operands)
+        elif op == "g":
+            st["fill"] = (round(float(operands[0]), 4),)
+        elif op == "G":
+            st["stroke"] = (round(float(operands[0]), 4),)
+        elif op in ("m", "l"):
+            path.append(_pt(st["ctm"], float(operands[0]), float(operands[1])))
+        elif op == "c":
+            for i in (0, 2, 4):
+                path.append(_pt(st["ctm"], float(operands[i]), float(operands[i + 1])))
+        elif op == "re":
+            x, y, w, h = [float(v) for v in operands]
+            path += [_pt(st["ctm"], px, py) for px, py in ((x, y), (x + w, y), (x + w, y + h), (x, y + h))]
+        elif op in ("f", "F", "f*", "S", "B", "B*"):
+            fill = op in ("f", "F", "f*", "B", "B*")
+            stroke = op in ("S", "B", "B*")
+            if path and ((fill and _green(st["fill"])) or (stroke and _green(st["stroke"]))):
+                xs, ys = [p[0] for p in path], [p[1] for p in path]
+                x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+                if 5 <= x1 - x0 <= 14 and 5 <= y1 - y0 <= 14 and x0 < 70:
+                    marks.append({"x": (x0 + x1) / 2, "y": (y0 + y1) / 2})
+            path = []
+        elif op == "n":
+            path = []
+    return marks
+
+
+def _titleish(line):
+    text = line["text"].strip()
+    if not text or COURSE_CODE.search(text) or text.startswith(("Still needed:", "Credits applied:", "Course Title")):
+        return False
+    if text.isupper() and len(text) >= 4:
+        return True
+    return line["font"] >= 12 and not any(x in text for x in ("Credits applied", "Course Title"))
+
+
+def _codes_between(lines, start, title):
+    out, seen = [], set()
+    collected = False
+    last_code_y = None
+    start_x = lines[start]["x"]
+    broad = "MATH REQUIREMENT" in title.upper()
+    broad_floor = None
+    if broad:
+        boundary = next((line for line in lines[start + 1:] if line["text"].strip().startswith(("Electives", "Insufficient Grades", "In-progress", "Legend"))), None)
+        broad_floor = boundary["y"] + 14 if boundary else None
+    else:
+        green_labels = [line for line in lines[start + 1:] if line.get("green") and not line["codes"] and line["x"] <= start_x + 8]
+        broad_floor = green_labels[1]["y"] + 14 if len(green_labels) > 1 else None
+    for line in lines[start + 1:]:
+        text = line["text"].strip()
+        if broad_floor is not None and line["y"] <= broad_floor:
+            break
+        if text.startswith(("Still needed:", "Insufficient Grades", "In-progress", "Course Title", "Legend")):
+            break
+        if broad and text.startswith("Electives"):
+            break
+        if not broad and collected and line.get("green") and not line["codes"] and line["x"] <= start_x + 8 and (last_code_y is None or last_code_y - line["y"] > 14):
+            break
+        if not broad and collected and _titleish(line):
+            break
+        for code in line["codes"]:
+            if code not in seen:
+                out.append(by_code[code])
+                seen.add(code)
+                collected = True
+                last_code_y = line["y"]
+    return out
+
+
+def extract_completed_requirements(data):
+    from pypdf import PdfReader
+
+    reader = PdfReader(BytesIO(data))
+    completed = []
+    for pageno, page in enumerate(reader.pages, 1):
+        lines = _page_text_lines(page, pageno)
+        marks = _green_marks(page, reader)
+        for line in lines:
+            line["green"] = any(abs(line["y"] - mark["y"]) <= 5 and abs(line["x"] - mark["x"]) <= 45 for mark in marks)
+        page_titles = []
+        for i, line in enumerate(lines):
+            text = re.sub(r"\s+(COMPLETE|STILL NEEDED)$", "", line["text"]).strip()
+            if not (_titleish(line) and (line["green"] or line["text"].endswith(" COMPLETE"))):
+                continue
+            courses_for_req = _codes_between(lines, i, text)
+            if courses_for_req or "REQUIREMENT" in text.upper():
+                page_titles.append({"title": text, "x": line["x"], "idx": i, "courses": courses_for_req})
+        for item in page_titles:
+            parent = next((p["title"] for p in reversed(page_titles) if p["idx"] < item["idx"] and p["x"] < item["x"] - 2), None)
+            completed.append({"title": item["title"], "parent": parent, "courses": item["courses"], "page": pageno})
+    return completed
+
+
+def parse_audit_pdf(data):
+    text = extract_audit_pdf(data)
+    audit = parse_degreeworks_text(text)
+    audit["completedRequirements"] = extract_completed_requirements(data)
+    return audit
 
 
 def multipart_file(headers, data):
@@ -195,11 +371,54 @@ def pathways(taken):
 
 
 # ---- Major requirements ----------------------------------------------------------------------------
-def major_progress(program, taken):
+def audit_reqs(body_or_reqs):
+    reqs = body_or_reqs if isinstance(body_or_reqs, list) else body_or_reqs.get("auditRequirements", [])
+    out = []
+    for req in reqs or []:
+        if not isinstance(req, dict):
+            continue
+        ids = [cid for cid in req.get("courses", []) if cid in courses]
+        out.append({"title": str(req.get("title") or ""), "parent": req.get("parent"), "courses": ids,
+                    "page": req.get("page") if isinstance(req.get("page"), int) else None})
+    return out
+
+
+def is_math_req(req):
+    return "math" in norm(req["name"])
+
+
+def is_calculus_option(option):
+    return any(courses[i]["subject"] == "MATH" and "calculus" in courses[i]["name"].lower() for i in option if i in courses)
+
+
+def audit_suppressed(program, audit_requirements):
+    reqs = audit_reqs(audit_requirements)
+    titles = [norm(r["title"]) for r in reqs if r["courses"]]
+    suppressed = set()
+    for req in program["requirements"]:
+        if not is_math_req(req):
+            continue
+        all_options = [o for rule in req["rules"] for o in rule["options"]]
+        if any(t == "calculusrequirement" for t in titles):
+            suppressed |= {i for o in all_options if is_calculus_option(o) for i in o}
+        elif any(t == "mathrequirement" for t in titles):
+            suppressed |= {i for o in all_options for i in o}
+    return suppressed
+
+
+def math_audit_completions(audit_requirements):
+    calc_done = [r for r in audit_requirements if norm(r["title"]) == "calculusrequirement" and r["courses"]]
+    math_done = [r for r in audit_requirements if norm(r["title"]) == "mathrequirement" and r["courses"]]
+    return calc_done or math_done
+
+
+def major_progress(program, taken, audit_requirements=None):
+    audit_requirements = audit_reqs(audit_requirements or [])
     out = []
     for req in program["requirements"]:
         have = need = 0
         completed, missing = [], []   # completed/todo options (OR-groups)
+        audit_completed = []
         for rule in req["rules"]:
             sat = [o for o in rule["options"] if any(i in taken for i in o)]
             need += rule["n"]
@@ -207,8 +426,32 @@ def major_progress(program, taken):
             completed += [[i for i in o if i in taken] for o in sat]
             if have < need:
                 missing += [o for o in rule["options"] if o not in sat]
-        out.append({"name": req["name"], "have": have, "need": need, "set": next((r["set"] for r in req["rules"] if r.get("set")), None),
-                    "unit": "credits" if any(r["kind"] == "credits" for r in req["rules"]) else "courses", "completed": completed, "missing": missing})
+        if is_math_req(req):
+            audit_math_done = math_audit_completions(audit_requirements)
+            calc_done = [r for r in audit_math_done if norm(r["title"]) == "calculusrequirement"]
+            if calc_done and missing:
+                covered = [o for o in missing if is_calculus_option(o)]
+                if covered:
+                    missing = [o for o in missing if o not in covered]
+                    have += len(covered)
+                    audit_completed += calc_done
+                    if not missing:
+                        have = max(have, need)
+            elif audit_math_done and norm(audit_math_done[0]["title"]) == "mathrequirement":
+                missing = []
+                have = max(have, need)
+                audit_completed += audit_math_done
+        completed_keys = {tuple(o) for o in completed}
+        for req_done in audit_completed:
+            key = tuple(req_done["courses"])
+            if key and key not in completed_keys:
+                completed.append(req_done["courses"])
+                completed_keys.add(key)
+        item = {"name": req["name"], "have": have, "need": need, "set": next((r["set"] for r in req["rules"] if r.get("set")), None),
+                "unit": "credits" if any(r["kind"] == "credits" for r in req["rules"]) else "courses", "completed": completed, "missing": missing}
+        if audit_completed:
+            item["auditCompleted"] = audit_completed
+        out.append(item)
     return out
 
 
@@ -313,9 +556,10 @@ def map_rank(program, cid):
     return 99
 
 
-def candidates(program, taken, term, avail=None):
+def candidates(program, taken, term, avail=None, audit_requirements=None):
     taken = set(taken)
-    major = major_progress(program, taken)
+    audit_requirements = audit_reqs(audit_requirements or [])
+    major = major_progress(program, taken, audit_requirements)
     slots = pathways(taken)
     open_slots = [(s["slot"], s["label"], fit) for s, (_, _, fit) in zip(slots, SLOTS) if not s["course"]]
     need_w = sum(1 for s in slots if s["slot"].startswith("W") and not s["course"])
@@ -323,9 +567,10 @@ def candidates(program, taken, term, avail=None):
     major_subjects = {courses[i]["subject"] for i in major_ids if i in courses}
     eligible = {cid for cid in courses if cid not in taken and prereqs_met(cid, taken)}
     eligible |= {cid for cid in coreqs if cid not in taken and prereqs_met(cid, taken | eligible)}   # coreq: pair with a same-term course
+    suppressed = audit_suppressed(program, audit_requirements)
     out = []
     for cid, c in courses.items():
-        if cid not in eligible or not offered(cid, term) or c["credits"] == 0:
+        if cid in suppressed or cid not in eligible or not offered(cid, term) or c["credits"] == 0:
             continue
         secs = available(cid, term, avail)
         if secs == []:                       # has real sections, none the student can attend -- drop it
@@ -487,11 +732,12 @@ def suggest(body):
     terms = body.get("terms") or ([body["taken"]] if body.get("taken") else [])   # ordered approved terms (or a flat list)
     taken = {i for t in terms for i in t}
     avail = body.get("avail") or None
-    cands, progress = candidates(program, taken, term, avail)
+    audit_requirements = audit_reqs(body)
+    cands, progress = candidates(program, taken, term, avail, audit_requirements)
     valid = {c["id"]: c for c in cands}
     locked = [valid[i] for i in dict.fromkeys(body.get("pins", []) + body.get("queue", [])) if i in valid]
     key = (body["program"], tuple(tuple(t) for t in terms), term, tuple(c["id"] for c in locked),
-           json.dumps(avail, sort_keys=True))
+           json.dumps(avail, sort_keys=True), json.dumps(audit_requirements, sort_keys=True))
     if not body.get("fresh") and key in _cache:
         return _cache[key]
     lcr = sum(courses[c["id"]]["credits"] for c in locked)
@@ -541,7 +787,7 @@ class Handler(BaseHTTPRequestHandler):
                 pdf = multipart_file(self.headers, raw)
                 if not pdf:
                     return self._send({"error": "Upload a DegreeWorks PDF."}, 400)
-                return self._send(parse_degreeworks_text(extract_audit_pdf(pdf)))
+                return self._send(parse_audit_pdf(pdf))
             except Exception as e:
                 return self._send({"error": str(e)}, 400)
         body = json.loads(raw or b"{}")
